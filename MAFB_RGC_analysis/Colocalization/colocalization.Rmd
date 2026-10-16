@@ -1,0 +1,204 @@
+---
+title: "colocalization"
+author: "Nina"
+date: "2026-03-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(here)
+library(tidyr)
+```
+
+```{r}
+save <- here("Colocalization")
+file <- here("data","colocalization.xlsx")
+```
+
+```{r}
+
+library(stringr)
+sheets <- c("foxp2","opn","satb1","satb2","tbr1","tusc5","brnc3")
+
+# helper to evaluate the predicted_normalized formula from the first row
+get_predicted_value <- function(df) {
+  
+  pred_formula <- df[[8]][1]   # predicted_normalized column (H)
+  predicted_col <- df[[7]][1]  # predicted column (G)
+  lookup_vals <- suppressWarnings(as.numeric(df[[10]]))  # column J values
+  
+  # if predicted column is 0, return 0
+  if (!is.na(predicted_col) && suppressWarnings(as.numeric(predicted_col)) == 0) {
+    return(0)
+  }
+  
+  # if already numeric, use it
+  if (!is.na(pred_formula) && is.numeric(pred_formula)) {
+    return(pred_formula)
+  }
+  
+  # if blank, return 0
+  if (is.na(pred_formula) || pred_formula == "") {
+    return(0)
+  }
+  
+  pred_formula <- as.character(pred_formula)
+  pred_formula <- gsub("^=", "", pred_formula)
+  pred_formula <- gsub("\\$", "", pred_formula)
+  
+  # handle SUM(J4:J7)
+  if (grepl("^SUM\\(", pred_formula)) {
+    inside <- str_match(pred_formula, "SUM\\((J\\d+):(J\\d+)\\)")
+    start_row <- as.numeric(sub("J", "", inside[2]))
+    end_row   <- as.numeric(sub("J", "", inside[3]))
+    return(sum(lookup_vals[start_row:end_row], na.rm = TRUE))
+  }
+  
+  # handle formulas like J2+J5+J6+J7
+  refs <- unlist(str_extract_all(pred_formula, "J\\d+"))
+  if (length(refs) > 0) {
+    rows <- as.numeric(sub("J", "", refs))
+    return(sum(lookup_vals[rows], na.rm = TRUE))
+  }
+  
+  return(NA_real_)
+}
+
+animal_means <- map_df(sheets, function(s) {
+  
+  df <- read_excel(file, sheet = s, col_names = TRUE, .name_repair = "unique")
+  
+  # keep only real image rows
+  df_images <- df %>%
+    filter(!is.na(id), !is.na(replica))
+  
+  # 5th column is the marker-specific coloc count
+  coloc_col <- names(df_images)[5]
+  
+  # calculate actual percentage directly from counts
+  df_images <- df_images %>%
+    mutate(
+      actual_percentage = (.data[[coloc_col]] / tdt) * 100
+    )
+  
+  # average replicas within animal
+  animal_df <- df_images %>%
+    group_by(id) %>%
+    summarise(
+      actual = mean(actual_percentage, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      marker = s,
+      predicted = get_predicted_value(df)
+    )
+  
+  animal_df
+})
+
+animal_means$marker <- factor(
+  animal_means$marker,
+  levels = c("opn", "brnc3", "foxp2", "tbr1", "satb1", "satb2", "tusc5")
+)
+
+# n should now be number of animals
+n_counts <- animal_means %>%
+  group_by(marker) %>%
+  summarise(n = n_distinct(id), .groups = "drop")
+
+print(n_counts)
+print(animal_means %>% filter(marker == "opn"))
+
+# make long format
+data_long <- animal_means %>%
+  pivot_longer(
+    cols = c(actual, predicted),
+    names_to = "type",
+    values_to = "value"
+  ) %>%
+  mutate(
+    type = recode(type,
+      actual = "Actual",
+      predicted = "Predicted"
+    )
+  )
+
+colocalization <- ggplot(data_long, aes(x = marker, y = value, fill = type)) +
+  
+  geom_bar(
+    stat = "summary",
+    fun = "mean",
+    color = "black",
+    width = 0.7,
+    position = position_dodge(width = 0.8)
+  ) +
+  
+  geom_errorbar(
+    data = subset(data_long, type == "Actual"),
+    stat = "summary",
+    fun.data = mean_se,
+    width = 0.2,
+    position = position_dodge(width = 0.8)
+  ) +
+  
+  geom_point(
+    data = subset(data_long, type == "Actual"),
+    aes(fill = type),
+    position = position_jitterdodge(
+      jitter.width = 0.08,
+      dodge.width = 0.8
+    ),
+    size = 3,
+    shape = 21,
+    color = "black",
+    stroke = 0.6,
+    alpha = 0.5
+  ) +
+  
+  geom_text(
+    data = n_counts,
+    aes(x = marker, y = 95, label = paste0("n=", n)),
+    inherit.aes = FALSE,
+    size = 5
+  ) +
+  
+  scale_fill_manual(
+    values = c("Actual" = "grey40", "Predicted" = "white")
+  ) +
+  
+  scale_y_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 20)
+  ) +
+  
+  labs(
+    x = "Marker",
+    y = "% colocalization",
+    fill = NULL
+  ) +
+  
+  theme_classic() +
+  theme(
+    legend.position = "bottom",
+    plot.margin = margin(t = 30, r = 10, b = 10, l = 10),
+    axis.text.y  = element_text(size = 16, color = "black"),
+    axis.title.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20),
+    axis.text.x  = element_text(size = 16, angle = 45, hjust = 1, color = "black"),
+    axis.ticks = element_line(linewidth = 1.5),
+    axis.ticks.length = unit(0.4, "cm")
+  )
+
+colocalization
+
+ggsave("colocalization_plot.pdf", plot = colocalization, width = 7, height = 5)
+```
+

@@ -1,0 +1,489 @@
+---
+title: "Spike validation"
+author: "Nina"
+date: "2026-08-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(PatchR)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(gridExtra)
+library(here)
+```
+
+```{r}
+
+# Input/output folders
+data_dir <- here("Physiology", "datfiles")
+save_dir <- here("Physiology", "Physiology Script", "validation")
+
+dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Recording file
+data_file <- file.path(
+  data_dir,
+  "276_2026-03-25_001.dat"
+)
+
+# PatchMaster location
+experiment_number <- 3
+series_number <- 16
+
+# Sweep to inspect closely
+validation_sweep <- 3
+
+# Spike detection parameters
+baseline_time_limit <- 0.5
+spike_amplitude_threshold <- 25
+derivative_quantile <- 0.99
+refractory_period <- 0.002
+
+# Spike waveform window
+pre_ms <- 3
+post_ms <- 3
+
+# Plotting windows
+validation_start <- 1.75
+validation_end <- 4
+stimulus_start <- 2
+stimulus_end <- 3
+
+
+# ============================================================
+# FILE INFORMATION
+# ============================================================
+
+current_date <- Sys.Date()
+
+data_filename <- extract_filename(data_file)
+
+file_prefix <- paste(
+  current_date,
+  data_filename,
+  paste0("E", experiment_number),
+  paste0("S", series_number),
+  sep = "_"
+)
+
+message("Analyzing: ", data_filename)
+
+
+# ============================================================
+# IMPORT RECORDING
+# ============================================================
+
+recording <- ImportPRecording(
+  data_file,
+  experiment = experiment_number,
+  series = series_number,
+  traces = 1,
+  encoding = getOption("encoding"),
+  filetype = "PatchMaster",
+  verbose = TRUE
+)
+
+timepoints <- recording@TimeTrace
+
+current_data_pA <- recording@Data[["Imon-1"]] * 1e12
+
+colnames(current_data_pA) <- as.numeric(
+  gsub("s|:", "", colnames(current_data_pA))
+)
+
+
+# ============================================================
+# FORMAT SWEEPS AND DETECT SPIKES
+# ============================================================
+
+sweeps_data <- as.data.frame(current_data_pA) %>%
+  mutate(Time = timepoints) %>%
+  pivot_longer(
+    cols = -Time,
+    names_to = "Sweep",
+    values_to = "Current"
+  ) %>%
+  arrange(Sweep, Time) %>%
+  group_by(Sweep) %>%
+  mutate(
+
+    # Baseline
+    Baseline = mean(
+      Current[Time < baseline_time_limit],
+      na.rm = TRUE
+    ),
+
+    # Baseline-subtracted current
+    Current_above_baseline = Current - Baseline,
+
+    # Derivative
+    Current_derivative =
+      c(NA, diff(Current_above_baseline)) /
+      c(NA, diff(Time)),
+
+    # Sweep-specific derivative threshold
+    Threshold = quantile(
+      Current_derivative,
+      derivative_quantile,
+      na.rm = TRUE
+    ),
+
+    # Initial spike detection
+    Is_spike =
+      Current_derivative > Threshold &
+      Current_above_baseline > spike_amplitude_threshold,
+
+    Spike_time = if_else(
+      Is_spike,
+      Time,
+      NA_real_
+    )
+  ) %>%
+
+  # Carry last detected spike time down
+  fill(Spike_time, .direction = "down") %>%
+
+  mutate(
+    Previous_spike_time = lag(Spike_time),
+
+    Time_since_last_spike =
+      Time - Previous_spike_time,
+
+    # Apply refractory period
+    Valid_spike =
+      Is_spike &
+      (
+        is.na(Previous_spike_time) |
+        Time_since_last_spike >= refractory_period
+      ),
+
+    Is_spike = Valid_spike
+  ) %>%
+
+  select(
+    -Spike_time,
+    -Previous_spike_time,
+    -Time_since_last_spike,
+    -Valid_spike,
+    -Threshold
+  ) %>%
+  ungroup()
+
+
+# ============================================================
+# PLOT 1: ALL SWEEPS
+# ============================================================
+
+all_sweeps_plot <- ggplot(
+  sweeps_data,
+  aes(x = Time, y = Current)
+) +
+  geom_line(linewidth = 0.3) +
+  facet_wrap(
+    ~Sweep,
+    scales = "free_y"
+  ) +
+  coord_cartesian(
+    xlim = c(2, 4)
+  ) +
+  labs(
+    title = "Individual Sweeps",
+    x = "Time (s)",
+    y = "Current (pA)"
+  ) +
+  theme_minimal()
+
+all_sweeps_plot
+
+
+# ============================================================
+# PLOT 2: SINGLE VALIDATION SWEEP WITH STIMULUS
+# ============================================================
+
+single_sweep_id <- unique(sweeps_data$Sweep)[validation_sweep]
+
+single_sweep_data <- sweeps_data %>%
+  filter(
+    Sweep == single_sweep_id,
+    between(
+      Time,
+      validation_start,
+      validation_end
+    )
+  )
+
+y_max <- max(
+  single_sweep_data$Current,
+  na.rm = TRUE
+)
+
+y_min <- min(
+  single_sweep_data$Current,
+  na.rm = TRUE
+)
+
+y_range <- y_max - y_min
+
+bar_ymin <- y_max + 0.05 * y_range
+bar_ymax <- y_max + 0.10 * y_range
+
+single_sweep_plot <- ggplot(
+  single_sweep_data,
+  aes(x = Time, y = Current)
+) +
+  geom_line(
+    color = "black",
+    linewidth = 0.4
+  ) +
+  annotate(
+    "rect",
+    xmin = stimulus_start,
+    xmax = stimulus_end,
+    ymin = bar_ymin,
+    ymax = bar_ymax,
+    fill = "black"
+  ) +
+  coord_cartesian(
+    xlim = c(
+      validation_start,
+      validation_end
+    ),
+    ylim = c(
+      y_min,
+      bar_ymax
+    )
+  ) +
+  labs(
+    title = paste(
+      "Raw Trace for Sweep",
+      single_sweep_id
+    ),
+    x = "Time (s)",
+    y = "Current (pA)"
+  ) +
+  theme_minimal()
+
+single_sweep_plot
+
+
+# Save single sweep
+ggsave(
+  filename = file.path(
+    save_dir,
+    paste0(
+      file_prefix,
+      "_raw_sweep_",
+      single_sweep_id,
+      ".svg"
+    )
+  ),
+  plot = single_sweep_plot,
+  width = 6,
+  height = 4,
+  units = "in"
+)
+
+
+# ============================================================
+# PLOT 3: OVERLAY OF ALL SWEEPS
+# ============================================================
+
+overlay_plot <- ggplot(
+  sweeps_data,
+  aes(
+    x = Time,
+    y = Current,
+    color = as.factor(Sweep)
+  )
+) +
+  geom_line(linewidth = 0.3) +
+  labs(
+    title = "Overlay of All Sweeps",
+    x = "Time (s)",
+    y = "Current (pA)",
+    color = "Sweep"
+  ) +
+  theme_minimal()
+
+overlay_plot
+
+
+# ============================================================
+# PLOT 4: ONE SWEEP WITH DETECTED SPIKES
+# ============================================================
+
+first_sweep <- unique(sweeps_data$Sweep)[1]
+
+single_spike_plot <- ggplot(
+  sweeps_data %>%
+    filter(Sweep == first_sweep),
+  aes(x = Time, y = Current)
+) +
+  geom_line(
+    color = "black",
+    linewidth = 0.4
+  ) +
+  geom_point(
+    data = sweeps_data %>%
+      filter(
+        Sweep == first_sweep,
+        Is_spike
+      ),
+    color = "red",
+    size = 2
+  ) +
+  labs(
+    title = paste(
+      "Sweep",
+      first_sweep,
+      "with Detected Spikes"
+    ),
+    x = "Time (s)",
+    y = "Current (pA)"
+  ) +
+  theme_minimal()
+
+single_spike_plot
+
+
+# ============================================================
+# PLOT 5: ALL SWEEPS WITH DETECTED SPIKES
+# ============================================================
+
+stacked_spike_plot <- ggplot(
+  sweeps_data,
+  aes(x = Time, y = Current)
+) +
+  geom_line(linewidth = 0.3) +
+  geom_point(
+    data = sweeps_data %>%
+      filter(Is_spike),
+    color = "red",
+    size = 0.5
+  ) +
+  facet_wrap(
+    ~Sweep,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Individual Sweeps with Detected Spikes",
+    x = "Time (s)",
+    y = "Current (pA)"
+  ) +
+  theme_minimal()
+
+stacked_spike_plot
+
+
+# ============================================================
+# EXTRACT SPIKE WAVEFORMS
+# ============================================================
+
+spike_data <- sweeps_data %>%
+  filter(Is_spike) %>%
+  transmute(
+    Sweep,
+    Spike_Time = Time
+  )
+
+spike_segments <- lapply(
+  seq_len(nrow(spike_data)),
+  function(idx) {
+
+    central_time <- spike_data$Spike_Time[idx]
+    sweep_id <- spike_data$Sweep[idx]
+
+    sweeps_data %>%
+      filter(
+        Sweep == sweep_id,
+        between(
+          Time,
+          central_time - pre_ms / 1000,
+          central_time + post_ms / 1000
+        )
+      ) %>%
+      mutate(
+        Time_relative = Time - central_time,
+        Spike_ID = idx
+      )
+  }
+) %>%
+  bind_rows()
+
+
+# ============================================================
+# PLOT 6: SPIKE WAVEFORMS
+# ============================================================
+
+spike_waveform_plot <- ggplot(
+  spike_segments,
+  aes(
+    x = Time_relative * 1000,
+    y = Current,
+    group = Spike_ID
+  )
+) +
+  geom_line(
+    alpha = 0.3,
+    linewidth = 0.3
+  ) +
+  stat_summary(
+    aes(group = 1),
+    fun = mean,
+    geom = "line",
+    color = "red",
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Detected Spike Waveforms",
+    x = "Time around detected spike (ms)",
+    y = "Current (pA)"
+  ) +
+  theme_minimal()
+
+spike_waveform_plot
+
+
+# ============================================================
+# COMBINE VALIDATION PLOTS
+# ============================================================
+
+detected_spikes_plot <- grid.arrange(
+  single_spike_plot,
+  overlay_plot,
+  stacked_spike_plot,
+  spike_waveform_plot,
+  ncol = 1
+)
+
+
+# ============================================================
+# SAVE COMBINED VALIDATION FIGURE
+# ============================================================
+
+ggsave(
+  filename = file.path(
+    save_dir,
+    paste0(
+      file_prefix,
+      "_detected_spikes.png"
+    )
+  ),
+  plot = detected_spikes_plot,
+  width = 10,
+  height = 15,
+  dpi = 300
+)
+
+message(
+  "Validation plots saved to: ",
+  save_dir
+)
+```
+

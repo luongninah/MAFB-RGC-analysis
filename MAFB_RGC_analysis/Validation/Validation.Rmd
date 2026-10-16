@@ -1,0 +1,304 @@
+---
+title: "Untitled"
+author: "Nina"
+date: "2024-10-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(ggplot2)
+library(reshape2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(here)
+```
+
+```{r}
+save <- here("Validation")
+dir.create(save, recursive = TRUE, showWarnings = FALSE)
+```
+
+fig 1C
+```{r}
+# Read in the data
+data <- read_excel(
+  here("data", "validation.xlsx"),
+  sheet = "mafb tdtomato rbpms fig1C")
+
+# Calculate percent colocalization
+data <- data %>%
+  mutate(
+    Animal = str_extract(ID, "id\\d+"),  # Extract Animal ID
+    percent_mafb = (mafb / tdtomato) * 100,
+    percent_rbpms = (rbpms / tdtomato) * 100
+  )
+
+# Average across images per animal
+animal_avg <- data %>%
+  group_by(Animal) %>%
+  summarise(
+    mean_mafb = mean(percent_mafb, na.rm = TRUE),
+    mean_rbpms = mean(percent_rbpms, na.rm = TRUE)
+  )
+
+# Now average across animals and calculate SEM
+summary_data <- tibble(
+  mean_mafb = mean(animal_avg$mean_mafb, na.rm = TRUE),
+  sem_mafb = sd(animal_avg$mean_mafb, na.rm = TRUE) / sqrt(nrow(animal_avg)),
+  mean_rbpms = mean(animal_avg$mean_rbpms, na.rm = TRUE),
+  sem_rbpms = sd(animal_avg$mean_rbpms, na.rm = TRUE) / sqrt(nrow(animal_avg))
+)
+
+# Convert to long format for ggplot2
+summary_long <- summary_data %>%
+  pivot_longer(
+    cols = starts_with("mean"),
+    names_to = "Marker",
+    values_to = "Mean"
+  ) %>%
+  mutate(
+    SEM = c(summary_data$sem_mafb, summary_data$sem_rbpms),
+    Marker = recode(Marker, "mean_mafb" = "MAFB", "mean_rbpms" = "RBPMS")
+  )
+
+# Define your custom marker colors
+marker_colors <- c("MAFB" = "#808080", "RBPMS" = "#555555")
+
+# Plot
+mafb <- ggplot(summary_long, aes(x = Marker, y = Mean)) +
+  geom_bar(stat = "identity",
+           width = 0.8,
+           aes(color = Marker),
+           fill = marker_colors,
+           size = 3) +
+ geom_errorbar(
+  aes(ymin = Mean - SEM, ymax = Mean + SEM),
+  width = 0.5,
+  linewidth = 1.5,     # line thickness
+  color = "black",     # force black color
+  position = position_dodge(width = 0.5)
+)+
+  geom_jitter(
+    data = animal_avg %>%
+      pivot_longer(
+        cols = c(mean_mafb, mean_rbpms),
+        names_to = "Marker",
+        values_to = "Value"
+      ) %>%
+      mutate(
+        Marker = recode(
+          Marker,
+          "mean_mafb" = "MAFB",
+          "mean_rbpms" = "RBPMS"
+        )
+      ),
+    aes(x = Marker, y = Value, fill = Marker),
+    shape = 21,
+    size = 8,
+    stroke = 2,
+    color = "black",
+    width = 0.15,
+    alpha = 0.8
+  ) +
+  scale_color_manual(values = marker_colors) +
+  scale_fill_manual(values = marker_colors) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "% colocalization with mCherry cells"
+  ) +
+  theme_classic() +
+   theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.margin = margin(t = 30, r = 10, b = 10, l = 10),
+    axis.text.y = element_text(size = 20, color = "black"),
+    axis.title.y = element_text(size = 20),
+    axis.text.x = element_text(size = 20, color = "black"),
+    axis.title.x = element_text(size = 20),
+    axis.ticks = element_line(size = 1.5),             # Tick thickness
+    axis.ticks.length = unit(0.4, "cm")
+  )+
+  scale_y_continuous(
+    limits = c(0, 110),
+    expand = c(0, 0)
+  )
+
+mafb
+
+ggsave("mafb_colocalization.pdf", plot = mafb, path = save, device = pdf, width = 4, height = 6, dpi = 300)
+```
+fig 1I
+```{r}
+# Read in the data
+data <- read_excel(
+  here("data", "validation.xlsx"),
+  sheet = "tdtomato gfp fig1I")
+
+# Calculate percent colocalization
+data <- data %>%
+  mutate(
+    Animal = str_extract(ID, "id\\d+"),  # Extract Animal ID
+    percent_e = (`GFPTdt` / `Tdtomato`) * 100,
+    percent_s = (`GFPTdt` / `GFP`) * 100
+  )
+
+# Average across images per animal
+animal_avg <- data %>%
+  group_by(Animal) %>%
+  summarise(
+    mean_e = mean(percent_e, na.rm = TRUE),
+    mean_s = mean(percent_s, na.rm = TRUE)
+  )
+
+
+# Now average across animals and calculate SEM
+summary_data <- tibble(
+  mean_e = mean(animal_avg$mean_e, na.rm = TRUE),
+  sem_e = sd(animal_avg$mean_e, na.rm = TRUE) / sqrt(nrow(animal_avg)),
+  mean_s = mean(animal_avg$mean_s, na.rm = TRUE),
+  sem_s = sd(animal_avg$mean_s, na.rm = TRUE) / sqrt(nrow(animal_avg))
+)
+
+# Convert to long format for ggplot2
+summary_long <- summary_data %>%
+  pivot_longer(
+    cols = starts_with("mean"),
+    names_to = "Marker",
+    values_to = "Mean"
+  ) %>%
+  mutate(
+    SEM = c(summary_data$sem_e, summary_data$sem_s),
+    Marker = recode(Marker, "mean_e" = "Efficiency", "mean_s" = "Specificity")
+  )
+
+# Define your custom marker colors
+marker_colors <- c("Efficiency" = "#808080", "Specificity" = "#555555")
+
+# Plot
+colocalization <- ggplot(summary_long, aes(x = Marker, y = Mean)) +
+  geom_bar(stat = "identity",
+           width = 0.8,
+           aes(color = Marker),
+           fill = marker_colors,
+           size = 3) +
+   geom_errorbar(
+    aes(ymin = Mean - SEM, ymax = Mean + SEM),
+    width = 0.5,
+    linewidth = 1.5,
+    position = position_dodge(width = 0.5)
+  ) +
+  geom_jitter(
+    data = animal_avg %>%
+      pivot_longer(
+        cols = c(mean_e, mean_s),
+        names_to = "Marker",
+        values_to = "Value"
+      ) %>%
+      mutate(
+        Marker = recode(
+          Marker,
+          "mean_e" = "Efficiency",
+          "mean_s" = "Specificity"
+        )
+      ),
+    aes(x = Marker, y = Value, fill = Marker),
+    shape = 21,
+    size = 8,
+    stroke = 2,
+    color = "black",
+    width = 0.15,
+    alpha = 0.8
+  ) + 
+  scale_color_manual(values = marker_colors) +
+  scale_fill_manual(values = marker_colors) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "%"
+  ) +
+  theme_classic() +
+   theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.margin = margin(t = 30, r = 10, b = 10, l = 10),
+    axis.text.y = element_text(size = 20, color = "black"),
+    axis.title.y = element_text(size = 20),
+    axis.text.x = element_text(size = 20, color = "black"),
+    axis.title.x = element_text(size = 20),
+    axis.ticks = element_line(size = 1.5),             # Tick thickness
+    axis.ticks.length = unit(0.4, "cm"))+
+  scale_y_continuous(
+    limits = c(0, 110),
+    expand = c(0, 0)
+  )
+
+colocalization 
+
+ggsave("colocalization.pdf", plot = colocalization, path = save, device = pdf, width = 4, height = 6, dpi = 300)
+```
+predicted frequency fig 1e
+```{r}
+# Define data in top-to-bottom order
+predicted_frequencies <- tibble(
+  Cluster = c("c45", "c43", "c39", "c34", "c30", "c23"),  # TOP → BOTTOM
+  Frequency = c(0.5, 0.5, 1, 1.75, 2, 2)
+)
+
+# Factor levels (important for color mapping)
+predicted_frequencies <- predicted_frequencies %>%
+  mutate(Cluster = factor(Cluster, levels = c("c23", "c30", "c34", "c39", "c43", "c45")))
+
+# Custom colors
+custom_colors <- c(
+  "c23" = "#B0B0B0",
+  "c30" = "#999999",
+  "c34" = "#808080",
+  "c39" = "#666666",
+  "c43" = "#006B99",
+  "c45" = "#009967"
+)
+
+# Plot with reverse stacking!
+predicted <- ggplot(predicted_frequencies, aes(x = "Mafb+ RGCs", y = Frequency, fill = Cluster)) +
+  geom_bar(stat = "identity", width = 1, color = "black", size = 1, position = position_stack(reverse = TRUE)) +
+  geom_text(
+    aes(label = Cluster),
+    position = position_stack(vjust = 0.5, reverse = TRUE),  # also reverse for text
+    color = "black",
+    size = 8
+  ) +
+  scale_fill_manual(values = custom_colors) +
+  scale_y_continuous(
+    limits = c(0, 10),
+    expand = c(0, 0)
+  ) +
+  labs(x = NULL, y = "% predicted frequency") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.margin = margin(t = 30, r = 10, b = 10, l = 10),
+    axis.text.y = element_text(size = 16, color = "black"),
+    axis.title.y = element_text(size = 20),
+    axis.text.x = element_text(size = 16, color = "black"),
+    axis.title.x = element_text(size = 20),
+    axis.ticks = element_line(size = 1.5),             # Tick thickness
+    axis.ticks.length = unit(0.4, "cm")
+  )
+
+
+# Show plot
+predicted
+
+ggsave("predicted_mafb.pdf", plot = predicted, path = save, device = pdf, width = 3, height = 6, dpi = 300)
+
+
+```
+

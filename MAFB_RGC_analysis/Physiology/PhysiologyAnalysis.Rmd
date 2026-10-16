@@ -1,0 +1,3875 @@
+---
+title: "Untitled"
+author: "Nina"
+date: "2025-07-29"
+output: html_document
+---
+Before running this script, run the requirements script that contrains functions necessary to read the HEKA files. 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+These are the necessary packages you will need.  
+```{r}
+# Required libraries
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(signal)
+library(PatchR)
+library(minpack.lm)
+library(openxlsx)
+library(readr)
+library(purrr)
+library(rstatix)
+library(ggpubr)
+library(cowplot)
+library(forcats)
+library(grid)
+```
+
+```{r}
+save <- here("Physiology", "Physiology Script")
+dir.create(save, recursive = TRUE, showWarnings = FALSE)
+
+tracker_path <- here("data", "rawdata.xlsx")
+
+tracker <- read_excel(
+  tracker_path,
+  sheet = "rawphysiology"
+)
+```
+
+This is for adding columns into your excel tracker and creating the necessary file directory. 
+```{r}
+# Ensure columns exist before processing
+cols_to_add <- c("classification", "transient_sustained", "on_peak","on_peak_post", "off_peak","off_peak_post","on_fp_index", "off_fp_index", "on_baseline", "off_baseline", "on_latency_to_peak", "off_latency_to_peak","peakdiameter", "os_index","os_plot_peak", "contrast_plot_peak", "dsi_on", "dsi_off")
+
+for (col in cols_to_add) {
+  if (!col %in% names(tracker)) tracker[[col]] <- NA
+}
+
+base <- here("Physiology", "Physiology Script", "graphs")
+dir.create(base, recursive = TRUE, showWarnings = FALSE)
+
+save_paths <- list(
+  "ON-Transient"      = file.path(base, "lightstep-ON-Transient"),
+  "ON-Sustained"      = file.path(base, "lightstep-ON-Sustained"),
+  "OFF-Transient"     = file.path(base, "lightstep-OFF-Transient"),
+  "OFF-Sustained"     = file.path(base, "lightstep-OFF-Sustained"),
+  "ON-OFF-Transient"  = file.path(base, "lightstep_ON-OFF-Transient"),
+  "ON-OFF-Sustained"  = file.path(base, "lightstep-ON-OFF-Sustained"),
+  "NULL"  = file.path(base, "NULL"),
+  "lightstep_rds" = file.path(base, "lightstep_histograms_rds"),
+  "varieddiameter" = file.path (base, "varieddiameter"),
+  "varieddiameter_group" = file.path (base, "varieddiameter_group"),
+  "osindex" = file.path (base, "osindex"),
+  "contrast"= file.path (base, "contrast"),
+  "ds"= file.path(base, "ds"),
+  "varieddiameter_rds" = file.path(base, "varieddiameter_rds"),
+  "lightstep_stepwise_overlays" = file.path(base, "lightstep_stepwise_overlays"),
+  "summary" = file.path(base, "summaryplots"),
+  "stats" = file.path(base, "stats"),
+  "featureselectivity" = file.path(base, "featureselectivity_stats")
+)
+
+lapply(save_paths, dir.create, showWarnings = FALSE, recursive = TRUE)
+
+# Begin processing
+all_histograms <- list()
+```
+ 
+Picking the color choices of the individual graphs. 
+```{r}
+c1 <- "#3182bd"
+c2 <- "black"
+```
+
+```{r}
+# Define custom colors
+custom_colors <- c(
+  "OFF-Transient"       = "#006b99",
+  "ON-Sustained"        = "#009967",
+  "OFF-Sustained"       = "#F58A07",
+  "ON-OFF-Sustained"    = "#66C7F4",
+  "ON-OFF-Transient"    = "#020887"
+)
+
+# Set group plotting order
+group_order <- c(
+  "ON-Sustained",
+  "OFF-Transient",
+  "OFF-Sustained",
+  "ON-OFF-Transient",
+  "ON-OFF-Sustained"
+)
+```
+
+```{r}
+
+baseline_window <- c(0, 1)
+
+peak_window <- c(2.1, 2.9)
+post_window <- c(3.1, 3.9)
+final_window <- c(2.5, 2.99)
+
+polarity_ratio_threshold <- 0.35
+FP_TH <- 0.15
+```
+
+This chunk will process the light step stimuli and determine the cell's polarity (ON, OFF, ON/OFF) and kinetics (transient, sustained). 1/21/26 nl
+```{r}
+
+for (i in seq_len(nrow(tracker))) {
+  
+  row <- tracker[i, ]
+  
+  
+  # ----------------------------------------------------------
+  # Skip cells already classified
+  # ----------------------------------------------------------
+  
+  if (!is.na(row$classification) && row$classification != "") {
+    message(
+      "Skipping ",
+      row$file,
+      " - classification already exists (",
+      row$classification,
+      ")"
+    )
+    next
+  }
+  
+  
+  # Skip rows without file or experiment number
+  if (is.na(row$file) || is.na(row$e)) {
+    next
+  }
+  
+  
+  # ----------------------------------------------------------
+  # File information
+  # ----------------------------------------------------------
+  
+  data_file <- here(
+    "Physiology",
+    "datfiles",
+    row$file
+  )
+  
+  data_filename <- extract_filename(data_file)
+  experiment_number <- as.numeric(row$e)
+  
+  series_list_lightstep_ON  <- to_numeric_vector(row$on)
+  series_list_lightstep_OFF <- to_numeric_vector(row$off)
+  
+  message(
+    "Processing ",
+    data_filename,
+    " Experiment ",
+    experiment_number
+  )
+  
+  
+  # ==========================================================
+  # SPIKE FREQUENCY EXTRACTION
+  # ==========================================================
+  
+  all_spike_frequencies_ON <- if (!is.null(series_list_lightstep_ON)) {
+    process_series(series_list_lightstep_ON)
+  } else {
+    list()
+  }
+  
+  all_spike_frequencies_OFF <- if (!is.null(series_list_lightstep_OFF)) {
+    process_series(series_list_lightstep_OFF)
+  } else {
+    list()
+  }
+  
+  
+  combined_spike_frequency_df_ON <- if (
+    length(all_spike_frequencies_ON) > 0
+  ) {
+    combine_frequencies(
+      all_spike_frequencies_ON,
+      c1
+    )
+  } else {
+    data.frame()
+  }
+  
+  
+  combined_spike_frequency_df_OFF <- if (
+    length(all_spike_frequencies_OFF) > 0
+  ) {
+    combine_frequencies(
+      all_spike_frequencies_OFF,
+      c2
+    )
+  } else {
+    data.frame()
+  }
+  
+  
+  # Skip if neither condition produced usable data
+  if (
+    nrow(combined_spike_frequency_df_ON) == 0 &&
+    nrow(combined_spike_frequency_df_OFF) == 0
+  ) {
+    message(
+      "Skipping ",
+      data_filename,
+      " - no spike data for ON or OFF"
+    )
+    next
+  }
+  
+  
+  final_spike_frequency_df <- bind_rows(
+    combined_spike_frequency_df_ON,
+    combined_spike_frequency_df_OFF
+  )
+  
+  
+  # ==========================================================
+  # ON METRICS
+  # ==========================================================
+  
+  on_baseline <- get_mean_frequency(
+    combined_spike_frequency_df_ON,
+    baseline_window
+  )
+  
+  on_peak <- get_peak_frequency(
+    combined_spike_frequency_df_ON,
+    peak_window
+  )
+  
+  on_peak_post <- get_peak_frequency(
+    combined_spike_frequency_df_ON,
+    post_window
+  )
+  
+  on_final <- get_mean_frequency(
+    combined_spike_frequency_df_ON,
+    final_window
+  )
+  
+  on_fp_index <- get_fp_index(
+    baseline = on_baseline,
+    peak = on_peak,
+    final = on_final
+  )
+  
+  on_latency_to_peak <- if (
+    nrow(combined_spike_frequency_df_ON) > 0
+  ) {
+    latency_to_response(
+      combined_spike_frequency_df_ON,
+      t0 = 2,
+      baseline_window = baseline_window,
+      k = 2,
+      consecutive_bins = 2
+    )
+  } else {
+    NA_real_
+  }
+  
+  
+  # ==========================================================
+  # OFF METRICS
+  # ==========================================================
+  
+  off_baseline <- get_mean_frequency(
+    combined_spike_frequency_df_OFF,
+    baseline_window
+  )
+  
+  off_peak <- get_peak_frequency(
+    combined_spike_frequency_df_OFF,
+    peak_window
+  )
+  
+  off_peak_post <- get_peak_frequency(
+    combined_spike_frequency_df_OFF,
+    post_window
+  )
+  
+  off_final <- get_mean_frequency(
+    combined_spike_frequency_df_OFF,
+    final_window
+  )
+  
+  off_fp_index <- get_fp_index(
+    baseline = off_baseline,
+    peak = off_peak,
+    final = off_final
+  )
+  
+  off_latency_to_peak <- if (
+    nrow(combined_spike_frequency_df_OFF) > 0
+  ) {
+    latency_to_response(
+      combined_spike_frequency_df_OFF,
+      t0 = 2,
+      baseline_window = baseline_window,
+      k = 2,
+      consecutive_bins = 2
+    )
+  } else {
+    NA_real_
+  }
+  
+  
+  # ==========================================================
+  # WINDOW EVIDENCE
+  # ==========================================================
+  
+  on_win_ON   <- fires(on_peak, on_baseline)
+  on_win_OFF  <- fires(on_peak_post, on_baseline)
+  
+  off_win_OFF <- fires(off_peak, off_baseline)
+  off_win_ON  <- fires(off_peak_post, off_baseline)
+  
+  
+  on_fires  <- on_win_ON || off_win_ON
+  off_fires <- off_win_OFF || on_win_OFF
+  
+  
+  # Baseline-subtracted amplitudes
+  amp_on_ON   <- amp(on_peak, on_baseline)
+  amp_on_OFF  <- amp(on_peak_post, on_baseline)
+  
+  amp_off_OFF <- amp(off_peak, off_baseline)
+  amp_off_ON  <- amp(off_peak_post, off_baseline)
+  
+  
+  # Strongest valid ON evidence
+  on_amp_bs <- max(
+    if (on_win_ON)  amp_on_ON  else 0,
+    if (off_win_ON) amp_off_ON else 0,
+    na.rm = TRUE
+  )
+  
+  
+  # Strongest valid OFF evidence
+  off_amp_bs <- max(
+    if (off_win_OFF) amp_off_OFF else 0,
+    if (on_win_OFF)  amp_on_OFF  else 0,
+    na.rm = TRUE
+  )
+  
+  
+  # ==========================================================
+  # POLARITY CLASSIFICATION
+  # ==========================================================
+  
+  if (on_fires && off_fires) {
+    
+    ratio <- min(on_amp_bs, off_amp_bs) /
+      max(on_amp_bs, off_amp_bs)
+    
+    if (ratio >= polarity_ratio_threshold) {
+      classification <- "ON-OFF"
+      
+    } else if (on_amp_bs > off_amp_bs) {
+      classification <- "ON"
+      
+    } else {
+      classification <- "OFF"
+    }
+    
+  } else if (on_fires) {
+    
+    classification <- "ON"
+    
+  } else if (off_fires) {
+    
+    classification <- "OFF"
+    
+  } else {
+    
+    classification <- "NULL"
+  }
+  
+  
+  # ----------------------------------------------------------
+  # Opposite-window overrides
+  # ----------------------------------------------------------
+  
+  if (
+    classification == "ON" &&
+    off_win_OFF
+  ) {
+    classification <- "ON-OFF"
+  }
+  
+  if (
+    classification == "OFF" &&
+    on_win_ON
+  ) {
+    classification <- "ON-OFF"
+  }
+  
+  
+  # ==========================================================
+  # CHECK REQUIRED FP INDEX
+  # ==========================================================
+  
+  missing_required_fp <- dplyr::case_when(
+    classification == "ON" ~
+      is.na(on_fp_index),
+    
+    classification == "OFF" ~
+      is.na(off_fp_index),
+    
+    classification == "ON-OFF" ~
+      is.na(on_fp_index) & is.na(off_fp_index),
+    
+    TRUE ~ FALSE
+  )
+  
+  
+  if (missing_required_fp) {
+    classification <- "NULL"
+  }
+  
+  
+  # ==========================================================
+  # TRANSIENT / SUSTAINED CLASSIFICATION
+  # ==========================================================
+  
+  if (classification == "ON") {
+    
+    transient_sustained <- ifelse(
+      on_fp_index > FP_TH,
+      "Sustained",
+      "Transient"
+    )
+    
+  } else if (classification == "OFF") {
+    
+    transient_sustained <- ifelse(
+      off_fp_index > FP_TH,
+      "Sustained",
+      "Transient"
+    )
+    
+  } else if (classification == "ON-OFF") {
+    
+    max_fp_index <- max(
+      on_fp_index,
+      off_fp_index,
+      na.rm = TRUE
+    )
+    
+    transient_sustained <- ifelse(
+      max_fp_index > FP_TH,
+      "Sustained",
+      "Transient"
+    )
+    
+  } else {
+    
+    transient_sustained <- "NULL"
+  }
+  
+
+  
+  tracker$classification[i] <- classification
+  tracker$transient_sustained[i] <- transient_sustained
+  
+  tracker$on_peak[i] <- on_peak
+  tracker$on_peak_post[i] <- on_peak_post
+  
+  tracker$off_peak[i] <- off_peak
+  tracker$off_peak_post[i] <- off_peak_post
+  
+  tracker$on_baseline[i] <- on_baseline
+  tracker$off_baseline[i] <- off_baseline
+  
+  tracker$on_fp_index[i] <- on_fp_index
+  tracker$off_fp_index[i] <- off_fp_index
+  
+  tracker$on_latency_to_peak[i] <- on_latency_to_peak
+  tracker$off_latency_to_peak[i] <- off_latency_to_peak
+  
+  
+  # ==========================================================
+  # GROUP LABEL
+  # ==========================================================
+  
+  group_key <- if (classification == "NULL") {
+    "NULL"
+  } else {
+    paste(
+      classification,
+      transient_sustained,
+      sep = "-"
+    )
+  }
+  
+  
+  # ==========================================================
+  # OUTPUT DIRECTORY
+  # ==========================================================
+  
+  classification_dir <- save_paths[[group_key]]
+  
+  dir.create(
+    classification_dir,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+  
+  
+  # ==========================================================
+  # SAVE HISTOGRAM DATA
+  # ==========================================================
+  
+  final_spike_frequency_df$cell_id <- paste(
+    data_filename,
+    paste0("E", experiment_number)
+  )
+  
+  final_spike_frequency_df$group <- group_key
+  
+  all_histograms[[length(all_histograms) + 1]] <-
+    final_spike_frequency_df
+  
+  
+  saveRDS(
+    final_spike_frequency_df,
+    file = file.path(
+      save_paths[["lightstep_rds"]],
+      paste0(
+        data_filename,
+        "_E",
+        experiment_number,
+        "_hist.rds"
+      )
+    )
+  )
+  
+  
+  # ==========================================================
+  # SPIKE FREQUENCY PLOT
+  # ==========================================================
+  
+  max_spike_freq <- max(
+    final_spike_frequency_df$Average_Spike_Frequency,
+    na.rm = TRUE
+  )
+  
+  ylim_upper <- max_spike_freq * 1.25
+  
+  rect_ymax <- ylim_upper * 0.85
+  rect_height <- ylim_upper * 0.01
+  
+  
+  plot <- ggplot() +
+    
+    geom_rect(
+      aes(
+        xmin = 2,
+        xmax = 3,
+        ymin = rect_ymax,
+        ymax = rect_ymax + rect_height
+      ),
+      fill = "black"
+    ) +
+    
+    annotate(
+      "text",
+      x = 2.5,
+      y = rect_ymax,
+      label = "light step",
+      vjust = -1,
+      size = 5
+    ) +
+    
+    geom_col(
+      data = final_spike_frequency_df,
+      aes(
+        x = Bin_start_time,
+        y = Average_Spike_Frequency,
+        fill = Condition,
+        group = Condition
+      ),
+      position = position_dodge(width = 0.05),
+      width = 0.05
+    ) +
+    
+    scale_fill_manual(
+      values = c(c1, c2)
+    ) +
+    
+    labs(
+      x = "Time (s)",
+      y = "Spike frequency (spikes/s)"
+    ) +
+    
+    coord_cartesian(
+      xlim = c(0, 4.75),
+      ylim = c(0, ylim_upper),
+      expand = FALSE
+    ) +
+    
+    theme_classic() +
+    
+    theme(
+      legend.position = "none"
+    )
+  
+  
+  outfile <- file.path(
+    classification_dir,
+    paste0(
+      "spike_freq_",
+      data_filename,
+      "_E",
+      experiment_number,
+      ".png"
+    )
+  )
+  
+  
+  ggsave(
+    filename = outfile,
+    plot = plot,
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+  
+  
+  message("SAVED: ", outfile)
+}
+
+
+# ============================================================
+# SAVE TRACKER
+# ============================================================
+
+# Load existing workbook
+wb <- openxlsx::loadWorkbook(tracker_path)
+
+# Write updated tracker data
+openxlsx::writeData(
+  wb,
+  sheet = "rawphysiology",
+  x = tracker
+)
+
+# Save workbook
+openxlsx::saveWorkbook(
+  wb,
+  tracker_path,
+  overwrite = TRUE
+)
+
+# ============================================================
+# FINAL GROUP COUNTS
+# ============================================================
+
+tracker <- tracker %>%
+  mutate(
+    group = if_else(
+      is.na(classification) |
+        classification == "NULL",
+      "NULL",
+      paste(
+        classification,
+        transient_sustained,
+        sep = "-"
+      )
+    )
+  )
+
+
+group_counts <- tracker %>%
+  count(
+    group,
+    name = "n_cells"
+  ) %>%
+  arrange(
+    desc(n_cells)
+  )
+
+group_counts
+```
+
+This will plot the light step just for the c1 channel which for this is the ON step stimuli. It will do both individual plots, layered plots, and a plot that has all the traces from each group. 1/21/26 nl
+```{r}
+save_dir <- save_paths[["lightstep_stepwise_overlays"]]
+
+dir.create(
+  save_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+tracker <- tracker %>%
+  mutate(
+    classification = trimws(classification),
+    transient_sustained = trimws(transient_sustained),
+
+    group = case_when(
+      is.na(classification) | classification == "NULL" ~ NA_character_,
+      is.na(transient_sustained) | transient_sustained == "NULL" ~ NA_character_,
+      TRUE ~ paste(classification, transient_sustained, sep = "-")
+    ),
+
+    cell_id = paste(
+      extract_filename(
+        file.path(
+          here("Physiology", "datfiles"),
+          file
+        )
+      ),
+      paste0("E", e)
+    )
+  )
+
+# ============================================================
+# ONE CLASSIFICATION PER CELL
+# ============================================================
+
+tracker_groups <- tracker %>%
+  select(
+    cell_id,
+    group
+  ) %>%
+  filter(
+    !is.na(group)
+  ) %>%
+  distinct(
+    cell_id,
+    .keep_all = TRUE
+  )
+
+
+# ============================================================
+# LOAD SAVED LIGHT-STEP HISTOGRAMS
+# ============================================================
+
+rds_files <- list.files(
+  save_paths[["lightstep_rds"]],
+  pattern = "_hist\\.rds$",
+  full.names = TRUE
+)
+
+if (length(rds_files) == 0) {
+  stop("No light-step RDS files found.")
+}
+
+all_histograms <- lapply(
+  rds_files,
+  readRDS
+)
+
+pooled_data <- bind_rows(
+  all_histograms
+)
+
+
+# Remove old group assignments stored in RDS files.
+# The tracker is treated as the current source of truth.
+
+pooled_data <- pooled_data %>%
+  select(
+    -any_of("group")
+  ) %>%
+  inner_join(
+    tracker_groups,
+    by = "cell_id"
+  ) %>%
+  distinct(
+    cell_id,
+    Bin_start_time,
+    Condition,
+    .keep_all = TRUE
+  )
+
+
+# ============================================================
+# SELECT ON CONDITION
+# ============================================================
+
+pooled_data_on <- pooled_data %>%
+  filter(
+    Condition == "#3182bd"
+  )
+
+
+# ============================================================
+# CELL COUNTS
+# ============================================================
+
+group_n <- pooled_data_on %>%
+  distinct(
+    cell_id,
+    group
+  ) %>%
+  count(
+    group,
+    name = "n_cells"
+  ) %>%
+  mutate(
+    group_label = paste0(
+      group,
+      " (n=",
+      n_cells,
+      ")"
+    )
+  )
+
+
+# ============================================================
+# SUMMARY: MEAN ± SEM
+# ============================================================
+
+summary_histogram <- pooled_data_on %>%
+  group_by(
+    group,
+    Bin_start_time
+  ) %>%
+  summarise(
+    mean_frequency = mean(
+      Average_Spike_Frequency,
+      na.rm = TRUE
+    ),
+
+    sd_frequency = sd(
+      Average_Spike_Frequency,
+      na.rm = TRUE
+    ),
+
+    n_cells = n_distinct(
+      cell_id
+    ),
+
+    sem = sd_frequency / sqrt(n_cells),
+
+    .groups = "drop"
+  ) %>%
+  left_join(
+    group_n %>%
+      select(
+        group,
+        group_label
+      ),
+    by = "group"
+  )
+
+
+# ============================================================
+# FACTOR ORDER
+# ============================================================
+
+summary_histogram <- summary_histogram %>%
+  mutate(
+    group = factor(
+      group,
+      levels = group_order
+    )
+  )
+
+
+label_order <- group_n %>%
+  filter(
+    group %in% group_order
+  ) %>%
+  mutate(
+    group = factor(
+      group,
+      levels = group_order
+    )
+  ) %>%
+  arrange(
+    group
+  ) %>%
+  pull(
+    group_label
+  )
+
+
+summary_histogram <- summary_histogram %>%
+  mutate(
+    group_label = factor(
+      group_label,
+      levels = label_order
+    )
+  )
+
+
+# ============================================================
+# COLORS WITH N LABELS
+# ============================================================
+
+named_colors <- setNames(
+  custom_colors[
+    as.character(
+      group_n$group[
+        match(
+          label_order,
+          group_n$group_label
+        )
+      ]
+    )
+  ],
+  label_order
+)
+
+
+# ============================================================
+# MAIN GROUP AVERAGE PLOT
+# ============================================================
+
+spike_hist_plot <- ggplot(
+  summary_histogram,
+  aes(
+    x = Bin_start_time,
+    y = mean_frequency,
+    color = group_label,
+    fill = group_label
+  )
+) +
+
+  geom_ribbon(
+    aes(
+      ymin = pmax(
+        mean_frequency - sem,
+        0
+      ),
+      ymax = mean_frequency + sem
+    ),
+    alpha = 0.2,
+    color = NA
+  ) +
+
+  geom_line(
+    linewidth = 1
+  ) +
+
+  geom_vline(
+    xintercept = c(2, 3),
+    linetype = "dashed"
+  ) +
+
+  scale_x_continuous(
+    breaks = 2:4
+  ) +
+
+  scale_color_manual(
+    values = named_colors
+  ) +
+
+  scale_fill_manual(
+    values = named_colors
+  ) +
+
+  coord_cartesian(
+    xlim = c(1.75, 4)
+  ) +
+
+  labs(
+    x = "Time (s)",
+    y = "Spike frequency (Hz)",
+    color = NULL,
+    fill = NULL
+  ) +
+
+  theme_classic() +
+
+  theme(
+    legend.position = "right",
+
+    legend.text = element_text(
+      size = 16,
+      color = "black"
+    ),
+
+    axis.text = element_text(
+      size = 16,
+      color = "black"
+    ),
+
+    axis.title = element_text(
+      size = 30,
+      color = "black"
+    ),
+
+    axis.ticks.length = unit(
+      0.4,
+      "cm"
+    ),
+
+    plot.margin = margin(
+      t = 30,
+      r = 10,
+      b = 10,
+      l = 10
+    )
+  )
+
+spike_hist_plot
+
+
+# ============================================================
+# SAVE MAIN PLOT
+# ============================================================
+
+ggsave(
+  filename = file.path(
+    save_dir,
+    "ON_spike_hist_plot.pdf"
+  ),
+  plot = spike_hist_plot,
+  width = 10,
+  height = 6
+)
+
+
+# ============================================================
+# STEPWISE OVERLAYS
+# ============================================================
+
+for (i in seq_along(group_order)) {
+
+  included_groups <- group_order[
+    seq_len(i)
+  ]
+
+  current_group <- group_order[i]
+
+
+  included_data <- summary_histogram %>%
+    filter(
+      group %in% included_groups
+    ) %>%
+    mutate(
+      is_current =
+        as.character(group) ==
+        current_group
+    )
+
+
+  step_plot <- ggplot(
+    included_data,
+    aes(
+      x = Bin_start_time,
+      y = mean_frequency,
+      group = group
+    )
+  ) +
+
+    geom_ribbon(
+      aes(
+        ymin = pmax(
+          mean_frequency - sem,
+          0
+        ),
+        ymax = mean_frequency + sem,
+        fill = group,
+        alpha = ifelse(
+          is_current,
+          "current_ribbon",
+          "past_ribbon"
+        )
+      ),
+      color = NA
+    ) +
+
+    geom_line(
+      aes(
+        color = group,
+        alpha = ifelse(
+          is_current,
+          "current_line",
+          "past_line"
+        )
+      ),
+      linewidth = 1.2
+    ) +
+
+    geom_vline(
+      xintercept = c(2, 3),
+      linetype = "dashed"
+    ) +
+
+    scale_color_manual(
+      values = custom_colors
+    ) +
+
+    scale_fill_manual(
+      values = custom_colors
+    ) +
+
+    scale_alpha_manual(
+      values = c(
+        "current_ribbon" = 0.6,
+        "past_ribbon" = 0.1,
+        "current_line" = 1,
+        "past_line" = 0.1
+      ),
+      guide = "none"
+    ) +
+
+    coord_cartesian(
+      xlim = c(1.75, 4),
+      ylim = c(0, 150)
+    ) +
+
+    labs(
+      x = "Time (s)",
+      y = "Spike frequency (Hz)"
+    ) +
+
+    theme_classic() +
+
+    theme(
+      legend.position = "none",
+
+      axis.text = element_text(
+        size = 16,
+        color = "black"
+      ),
+
+      axis.title = element_text(
+        size = 30,
+        color = "black"
+      ),
+
+      axis.ticks.length = unit(
+        0.4,
+        "cm"
+      ),
+
+      plot.margin = margin(
+        t = 30,
+        r = 10,
+        b = 10,
+        l = 10
+      )
+    )
+
+
+  step_filename <- paste0(
+    "ON_stepwise_",
+    i,
+    "_",
+    gsub("-", "_", current_group),
+    ".pdf"
+  )
+
+
+  ggsave(
+    filename = file.path(
+      save_dir,
+      step_filename
+    ),
+    plot = step_plot,
+    width = 10,
+    height = 6
+  )
+}
+
+
+# ============================================================
+# INDIVIDUAL GROUP PLOTS
+# ============================================================
+
+individual_plots <- setNames(
+  vector(
+    "list",
+    length(group_order)
+  ),
+  group_order
+)
+
+
+for (grp in group_order) {
+
+  group_traces <- pooled_data_on %>%
+    filter(
+      group == grp
+    )
+
+  single_group_data <- summary_histogram %>%
+    filter(
+      group == grp
+    )
+
+
+  if (
+    nrow(group_traces) == 0 ||
+    nrow(single_group_data) == 0
+  ) {
+    message(
+      "Skipping empty group: ",
+      grp
+    )
+    next
+  }
+
+
+  n_label <- group_n %>%
+    filter(
+      group == grp
+    ) %>%
+    pull(
+      n_cells
+    )
+
+  if (length(n_label) == 0) {
+    n_label <- 0
+  }
+
+
+  plot_label <- paste0(
+    grp,
+    " (n=",
+    n_label,
+    ")"
+  )
+
+
+  individual_plot <- ggplot() +
+
+    # SEM ribbon
+    geom_ribbon(
+      data = single_group_data,
+      aes(
+        x = Bin_start_time,
+        ymin = pmax(
+          mean_frequency - sem,
+          0
+        ),
+        ymax = mean_frequency + sem
+      ),
+      fill = custom_colors[[grp]],
+      alpha = 0.18
+    ) +
+
+    # Individual cells
+    geom_line(
+      data = group_traces,
+      aes(
+        x = Bin_start_time,
+        y = Average_Spike_Frequency,
+        group = cell_id
+      ),
+      color = custom_colors[[grp]],
+      alpha = 0.2,
+      linewidth = 0.5
+    ) +
+
+    # Group mean
+    geom_line(
+      data = single_group_data,
+      aes(
+        x = Bin_start_time,
+        y = mean_frequency
+      ),
+      color = custom_colors[[grp]],
+      linewidth = 1.4
+    ) +
+
+    geom_vline(
+      xintercept = c(2, 3),
+      linetype = "dashed"
+    ) +
+
+    scale_x_continuous(
+      breaks = 2:4
+    ) +
+
+    coord_cartesian(
+      xlim = c(1.75, 4),
+      ylim = c(0, 250)
+    ) +
+
+    labs(
+      title = plot_label,
+      x = "Time (s)",
+      y = "Spike frequency (Hz)"
+    ) +
+
+    theme_classic() +
+
+    theme(
+      legend.position = "none",
+
+      plot.title = element_text(
+        size = 22,
+        hjust = 0.5
+      ),
+
+      axis.text = element_text(
+        size = 20,
+        color = "black"
+      ),
+
+      axis.title = element_text(
+        size = 30,
+        color = "black"
+      ),
+
+      axis.ticks = element_line(
+        linewidth = 1.5,
+        color = "black"
+      ),
+
+      axis.ticks.length = unit(
+        0.4,
+        "cm"
+      )
+    )
+
+
+  individual_plots[[grp]] <- individual_plot
+
+
+  filename <- paste0(
+    "ON_lightstep_",
+    gsub("-", "_", grp),
+    "_individual_avg.pdf"
+  )
+
+
+  ggsave(
+    filename = file.path(
+      save_dir,
+      filename
+    ),
+    plot = individual_plot,
+    width = 10,
+    height = 6
+  )
+}
+
+
+# ============================================================
+# DISPLAY INDIVIDUAL PLOTS
+# ============================================================
+
+for (p in individual_plots) {
+
+  if (!is.null(p)) {
+    print(p)
+  }
+}
+
+```
+
+This will plot the light step just for the c2 channel which for this is the OFF step stimuli. It will do both individual plots, layered plots, and a plot that has all the traces from each group. 1/21/26 nl 
+```{r}
+save_dir <- save_paths[["lightstep_stepwise_overlays"]]
+
+dir.create(
+  save_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+tracker <- tracker %>%
+  mutate(
+    classification = trimws(classification),
+    transient_sustained = trimws(transient_sustained),
+
+    group = case_when(
+      is.na(classification) | classification == "NULL" ~ NA_character_,
+      is.na(transient_sustained) | transient_sustained == "NULL" ~ NA_character_,
+      TRUE ~ paste(classification, transient_sustained, sep = "-")
+    ),
+
+    cell_id = paste(
+      extract_filename(
+        file.path(
+          here("Physiology", "datfiles"),
+          file
+        )
+      ),
+      paste0("E", e)
+    )
+  )
+
+
+tracker_groups <- tracker %>%
+  select(
+    cell_id,
+    group
+  ) %>%
+  filter(
+    !is.na(group)
+  ) %>%
+  distinct(
+    cell_id,
+    .keep_all = TRUE
+  )
+
+# Load histogram traces
+rds_files <- list.files(
+  save_paths[["lightstep_rds"]],
+  pattern = "_hist\\.rds$",
+  full.names = TRUE
+)
+
+all_histograms <- lapply(rds_files, readRDS)
+pooled_data <- bind_rows(all_histograms)
+
+if ("group" %in% names(pooled_data)) {
+  pooled_data <- pooled_data %>% select(-group)
+}
+
+pooled_data <- pooled_data %>%
+  select(-any_of("group")) %>%
+  inner_join(tracker_groups, by = "cell_id") %>%
+  distinct(cell_id, Bin_start_time, Condition, .keep_all = TRUE)
+
+# ON-only data for ON plots
+pooled_data_off <- pooled_data %>%
+  filter(Condition == "black")
+
+group_n <- pooled_data_off %>%
+  distinct(cell_id, group) %>%
+  count(group) %>%
+  mutate(group_label = paste0(group, " (n=", n, ")"))
+
+summary_histogram <- pooled_data_off %>%
+  group_by(group, Bin_start_time) %>%
+  summarise(
+    mean_frequency = mean(Average_Spike_Frequency, na.rm = TRUE),
+    sem = sd(Average_Spike_Frequency, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  left_join(group_n, by = "group")
+
+# Set factor levels
+summary_histogram$group <- factor(summary_histogram$group, levels = group_order)
+summary_histogram$group_label <- factor(summary_histogram$group_label, levels = group_n$group_label[match(group_order, group_n$group)])
+
+# build levels without NAs
+lvl_vec <- unique(stats::na.omit(group_n$group_label[match(group_order, group_n$group)]))
+
+# remove NA rows, then refactor
+summary_histogram <- summary_histogram %>%
+  dplyr::filter(!is.na(group_label)) %>%
+  dplyr::mutate(group_label = factor(group_label, levels = lvl_vec))
+
+# Map colors to group labels with n
+color_labels <- group_n$group_label[match(group_order, group_n$group)]
+named_colors <- setNames(custom_colors[group_order], color_labels)
+
+# Plot
+spike_hist_plot <- ggplot(
+  summary_histogram,
+  aes(
+    x = Bin_start_time,
+    y = mean_frequency,
+    color = group_label,
+    fill = group_label
+  )
+) +
+  geom_line(size = 1) +
+  geom_ribbon(
+    aes(ymin = mean_frequency - sem, ymax = mean_frequency + sem),
+    alpha = 0.2,
+    color = NA
+  ) +
+  geom_vline(xintercept = 2, linetype = "dashed") +
+  geom_vline(xintercept = 3, linetype = "dashed") +
+  scale_x_continuous(
+  limits = c(1, 4),
+  breaks = 1:4
+)+
+  scale_color_manual(values = named_colors) +
+  scale_fill_manual(values = named_colors) +
+  labs(x = "Time (s)", y = "Spike frequency (Hz)", title = NULL) +
+  theme_classic() +
+  theme(
+    legend.position = "right",
+    legend.text = element_text(size = 16, color = "black"),
+    plot.title = element_blank(),
+    plot.margin = margin(
+      t = 30,
+      r = 10,
+      b = 10,
+      l = 10
+    ),
+    axis.text.y = element_text(size = 16, color = "black"),
+    axis.title.y = element_text(size = 30),
+    axis.text.x = element_text(size = 16, color = "black"),
+    axis.title.x = element_text(size = 30),
+    axis.ticks.length = unit(0.4, "cm")
+  )
+
+# Save the main plot
+save_dir <- save_paths[["lightstep_stepwise_overlays"]]
+ggsave(
+  filename = "OFF_spike_hist_plot.pdf",
+  plot = spike_hist_plot,
+  path = save_dir,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+
+# Stepwise overlays
+for (i in seq_along(group_order)) {
+  included_groups <- group_order[1:i]
+  current_group <- group_order[i]
+  
+  included_data <- summary_histogram %>%
+    dplyr::filter(group %in% included_groups) %>%
+    mutate(is_current = group == current_group)
+  
+  step_plot <- ggplot(included_data,
+                      aes(x = Bin_start_time, y = mean_frequency, group = group)) +
+    geom_ribbon(
+      aes(
+        ymin = mean_frequency - sem,
+        ymax = mean_frequency + sem,
+        fill = group,
+        alpha = ifelse(is_current, "current_ribbon", "past_ribbon")
+      ),
+      color = NA
+    ) +
+    geom_line(aes(
+      color = group,
+      alpha = ifelse(is_current, "current_line", "past_line")
+    ), size = 1.2) +
+    geom_vline(xintercept = 2, linetype = "dashed") +
+    geom_vline(xintercept = 3, linetype = "dashed") +
+    scale_color_manual(values = custom_colors) +
+    scale_fill_manual(values = custom_colors) +
+    scale_alpha_manual(
+      values = c(
+        "current_ribbon" = 0.6,
+        "past_ribbon" = 0.1,
+        "current_line" = 1,
+        "past_line" = 0.1
+      ),
+      guide = "none"
+    ) +
+    coord_cartesian(ylim = c(0, 150)) +
+    labs(x = "Time (s)", y = "Spike frequency (Hz)", title = NULL) +
+    theme_classic() +
+    theme(
+      legend.position = "none",
+      plot.title = element_blank(),
+      plot.margin = margin(
+        t = 30,
+        r = 10,
+        b = 10,
+        l = 10
+      ),
+      axis.text.y = element_text(size = 16, color = "black"),
+      axis.title.y = element_text(size = 30),
+      axis.text.x = element_text(size = 16, color = "black"),
+      axis.title.x = element_text(size = 30),
+      axis.ticks.length = unit(0.4, "cm")
+    )
+  
+  
+  step_filename <- paste0("OFF_stepwise_", i, "_", gsub("-", "_", current_group), ".pdf")
+  ggsave(
+    step_filename,
+    plot = step_plot,
+    path = save_dir,
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+}
+
+individual_plots <- vector("list", length(group_order))
+names(individual_plots) <- group_order
+
+
+for (grp in group_order) {
+  group_traces <- pooled_data_off %>%
+    filter(group == grp)
+
+  single_group_data <- summary_histogram %>%
+    filter(group == grp)
+
+  if (nrow(group_traces) == 0 || nrow(single_group_data) == 0) {
+    message("Skipping empty group: ", grp)
+    next
+  }
+  
+  # n for title
+  n_label <- group_n$n[group_n$group == grp]
+  if (length(n_label) == 0)
+    n_label <- 0
+  group_label <- paste0(grp, " (n=", n_label, ")")
+  
+  individual_plot <- ggplot() +
+    geom_ribbon(
+      data = single_group_data,
+      aes(
+        x = Bin_start_time,
+        ymin = mean_frequency - sem,
+        ymax = mean_frequency + sem
+      ),
+      fill = custom_colors[[grp]],
+      alpha = 0.18
+    ) +
+    geom_line(
+      data = group_traces,
+      aes(x = Bin_start_time, y = Average_Spike_Frequency, group = cell_id),
+      color = custom_colors[[grp]],
+      alpha = 0.2,
+      linewidth = 0.5
+    ) +
+    geom_line(
+      data = single_group_data,
+      aes(x = Bin_start_time, y = mean_frequency),
+      color = custom_colors[[grp]],
+      linewidth = 1.4
+    ) +
+    geom_vline(xintercept = 2, linetype = "dashed") +
+    geom_vline(xintercept = 3, linetype = "dashed") +
+    scale_x_continuous(
+   limits = c(1.75, 4),
+  breaks = 2:4
+)+
+    coord_cartesian(ylim = c(0, 250)) +
+    labs(x = "Time (s)", y = "Spike frequency (Hz)", title = NULL) +
+    theme_classic() +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 22, hjust = 0.5),
+      axis.text.x = element_text(size = 20, color = "black"),
+      axis.text.y = element_text(size = 20, color = "black"),
+      axis.title.x = element_text(size = 30, color = "black"),
+      axis.title.y = element_text(size = 30, color = "black"),
+      axis.ticks = element_line(size = 1.5, color = "black"),
+      # tick color
+      axis.ticks.length = unit(0.4, "cm")
+    )
+  
+  individual_plots[[grp]] <- individual_plot
+  
+  filename <- paste0("OFF_lightstep_", gsub("-", "_", grp), "_individual_avg.pdf")
+  ggsave(
+    filename,
+    plot = individual_plot,
+    path = save_dir,
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+}
+
+# Show all individual plots at the end
+for (p in individual_plots) {
+  print(p)
+}
+
+
+```
+
+This will analyze each sweep for the spike frequency, which corresponds with a varying spot size. In my stimuli there were two stimuli, small various diameter that ranged from 25-325um and then normal various diameter that is from 50-1200um. 1/21/26 nl 
+```{r}
+all_diameter_histograms <- list()
+
+# Small diameter mapping
+small_diameters <- c(325, 175, 225, 125, 250, 275, 75, 200, 25, 150, 100, 50, 0, 300)
+names(small_diameters) <- paste0(1:14)
+
+# Regular diameter mapping
+diameters <- c(1000, 200, 900, 700, 400, 300, 1200, 50, 100, 600, 0, 800, 1100, 500)
+names(diameters) <- paste0(1:14)
+
+
+for (i in 1:nrow(tracker)) {
+  row <- tracker[i, ]
+  
+  data_file <- file.path(
+    here("Physiology", "datfiles"),
+    row$file
+  )
+data_filename <- tools::file_path_sans_ext(basename(data_file))
+  experiment_number <- as.numeric(row$e)
+  
+  
+  #skip if peakdiameter already exists
+  if (!is.na(row$peakdiameter)) {
+   message(paste("Skipping", row$file, "- peakdiameter already calculated."))
+   next
+  }
+  
+  data_filename <- tools::file_path_sans_ext(basename(row$file))
+  experiment_number <- as.numeric(row$e)
+  plot_title <- paste("diameter_plot", data_filename, experiment_number, sep = "_")
+  full_filename <- paste0(plot_title, ".png")
+  plot_path <- file.path(save_paths[["varieddiameter"]], full_filename)
+  
+  if (file.exists(plot_path)) {
+  message(paste("Skipping", row$file, "- diameter plot already exists."))
+  next
+  }
+  
+  if (is.na(row$file) || is.na(row$e))
+    next
+  
+    data_file <- file.path(
+      here("Physiology", "datfiles"),
+      row$file
+    )  
+  # Set default classification if NA
+  cell_class <- row$classification
+  if (is.na(cell_class))
+    cell_class <- "NULL"
+  
+  if (tolower(cell_class) == "null") {
+    message(paste("Skipping", data_filename, "- classification is NULL."))
+    next
+  }
+  
+  # Determine which series to use
+  series_ON <- parse_series(if (!is.na(row$vdsmallon))
+    row$vdsmallon
+    else
+      row$vdon)
+  series_OFF <- parse_series(if (!is.na(row$vdsmalloff))
+    row$vdsmalloff
+    else
+      row$vdoff)
+  
+  if (is.null(series_ON) && is.null(series_OFF)) {
+    message(paste("Skipping", data_filename, "- no vdon/vdoff data."))
+    next
+  }
+  
+  message(
+    paste(
+      "Processing",
+      data_filename,
+      "Experiment",
+      experiment_number,
+      "for varied diameter..."
+    )
+  )
+  
+  all_spike_frequencies <- list()
+  
+  if (cell_class == "ON" && !is.null(series_ON)) {
+    for (series in series_ON) {
+      all_spike_frequencies[[paste(series, "ON")]] <- process_series_vd(series, "ON")
+    }
+  } else if (cell_class == "OFF" && !is.null(series_OFF)) {
+    for (series in series_OFF) {
+      all_spike_frequencies[[paste(series, "OFF")]] <- process_series_vd(series, "OFF")
+    }
+  } else if (cell_class == "ON-OFF") {
+    if (!is.null(series_ON)) {
+      for (series in series_ON) {
+        all_spike_frequencies[[paste(series, "ON")]] <- process_series_vd(series, "ON")
+      }
+    }
+    if (!is.null(series_OFF)) {
+      for (series in series_OFF) {
+        all_spike_frequencies[[paste(series, "OFF")]] <- process_series_vd(series, "OFF")
+      }
+    }
+  }
+  
+  if (length(all_spike_frequencies) == 0) {
+    message(paste("No valid spike frequency data for", data_filename))
+    next
+  }
+  
+  combined_data <- bind_rows(all_spike_frequencies) %>%
+    group_by(Sweep, Response) %>%
+    summarise(MeanFrequency = mean(AvgFrequency, na.rm = TRUE),
+              .groups = 'drop')
+  
+  is_small <- !is.na(row$vdsmallon) || !is.na(row$vdsmalloff)
+  diameters_used <- if (is_small)
+    small_diameters
+  else
+    diameters
+  
+  diameter_mapping <- data.frame(Sweep = names(diameters_used),
+                                 Diameter = as.character(diameters_used))
+  combined_data <- left_join(diameter_mapping, combined_data, by = "Sweep")
+  combined_data$Diameter <- as.numeric(combined_data$Diameter)
+  
+  valid_peaks <- combined_data %>% dplyr::filter(!is.na(MeanFrequency), !is.na(Diameter))
+  
+  if (nrow(valid_peaks) > 0) {
+    peak_freq <- max(valid_peaks$MeanFrequency, na.rm = TRUE)
+    peak_row <- valid_peaks %>% dplyr::filter(MeanFrequency == peak_freq) %>% dplyr::slice(1)
+    tracker$peakdiameter[i] <- peak_row$Diameter
+  }
+  
+  ordered_avg_frequencies <- combined_data %>% arrange(Diameter, Response)
+  ordered_avg_frequencies$group <- paste(row$classification, row$transient_sustained, sep = "-")
+  ordered_avg_frequencies$File <- row$file
+  
+  # Save .rds per cell
+  rds_dir <- save_paths[["varieddiameter_rds"]]
+  rds_filename <- paste0(
+    tools::file_path_sans_ext(basename(row$file)),
+    "_",
+    experiment_number,
+    "_diameter_hist.rds"
+  )
+  rds_path <- file.path(rds_dir, rds_filename)
+  saveRDS(ordered_avg_frequencies, file = rds_path)
+  
+  
+  if (!exists("all_diameter_histograms"))
+    all_diameter_histograms <- list()
+  all_diameter_histograms[[length(all_diameter_histograms) + 1]] <- ordered_avg_frequencies
+  
+  diameter_plot <- ggplot(ordered_avg_frequencies,
+                          aes(
+                            x = as.factor(Diameter),
+                            y = MeanFrequency,
+                            fill = Response
+                          )) +
+    geom_bar(
+      stat = "identity",
+      position = position_dodge(width = 0.5),
+      width = 0.5,
+      alpha = 1
+    ) +
+    scale_fill_manual(values = c(c2, c1), na.translate = FALSE) +
+    labs(x = "Spot Diameter (µm)", y = "Spike frequency (spikes/s)", title = NULL) +
+    theme_classic() +
+    theme(
+      legend.position = "None",
+      plot.margin = margin(
+        t = 30,
+        r = 10,
+        b = 10,
+        l = 10
+      ),
+      axis.text.y = element_text(size = 12),
+      axis.title.y = element_text(size = 20),
+      axis.text.x = element_text(size = 12, face = "bold"),
+      axis.title.x = element_text(size = 20),
+      axis.line = element_line(color = "black")
+    ) +
+    scale_y_continuous(limits = c(
+      0,
+      max(ordered_avg_frequencies$MeanFrequency, na.rm = TRUE) * 1.2
+    ))
+  
+  print(diameter_plot)
+  
+  ggsave(
+    full_filename,
+    plot = diameter_plot,
+    device = "png",
+    path = save_paths[["varieddiameter"]],
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+}
+
+# Load existing workbook
+wb <- openxlsx::loadWorkbook(tracker_path)
+
+# Write updated tracker data
+openxlsx::writeData(
+  wb,
+  sheet = "rawphysiology",
+  x = tracker
+)
+
+# Save workbook
+openxlsx::saveWorkbook(
+  wb,
+  tracker_path,
+  overwrite = TRUE
+)
+```
+
+This plots both a bar and line graph for the varied diameter stimuli. 1/21/26 nl 
+```{r}
+rds_files <- list.files(save_paths[["varieddiameter_rds"]], pattern = "_diameter_hist\\.rds$", full.names = TRUE)
+all_diameter_histograms <- lapply(rds_files, readRDS)
+pooled_diameter <- bind_rows(all_diameter_histograms)
+
+custom_colors <- c(
+  "OFF-Transient"       = "#006b99",
+  "ON-Sustained"        = "#009967",
+  "OFF-Sustained"       = "#F58A07",
+  "ON-OFF-Sustained"    = "#66C7F4",
+  "ON-OFF-Transient"    = "#020887"
+)
+
+# Set group plotting order
+group_order <- c(
+  "ON-Sustained",
+  "OFF-Transient",
+  "OFF-Sustained",
+  "ON-OFF-Transient",
+  "ON-OFF-Sustained"
+)
+
+summary_diameter <- pooled_diameter %>%
+  group_by(group, Diameter) %>%
+  summarise(
+    mean_freq = mean(MeanFrequency, na.rm = TRUE),
+    sem = sd(MeanFrequency, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(group %in% group_order) %>%
+  mutate(group = factor(group, levels = group_order))
+
+
+# Generate and save plots
+for (grp in group_order) {
+  grp_data <- summary_diameter %>% dplyr::filter(group == grp)
+  
+  individual_plot <- ggplot(grp_data, aes(x = as.factor(Diameter), y = mean_freq)) +
+    geom_bar(
+      stat = "identity",
+      fill = custom_colors[[grp]],
+      width = 0.5,
+      alpha = 0.9
+    ) +
+    geom_errorbar(aes(ymin = mean_freq - sem, ymax = mean_freq + sem), width = 0.2) +
+    labs(x = "Spot Diameter (µm)", y = "Spike Frequency (Hz)", title = NULL) +
+    coord_cartesian(ylim = c(0, 200)) +
+    labs(x = NULL, y = NULL, title = NULL) +
+    theme_classic() +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 14),
+      axis.text.y = element_text(size = 10),
+      axis.title.y = element_text(size = 20),
+      axis.text.x = element_text(size = 20),
+      axis.title.x = element_text(size = 20),
+      axis.ticks = element_line(size = 1.5),
+      axis.ticks.length = unit(0.4, "cm")
+    )
+  
+  
+  ggsave(
+    filename = paste0("diameter_plot_", gsub("-", "_", grp), ".pdf"),
+    plot = individual_plot,
+    path = save_paths[["varieddiameter_group"]],
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+}
+
+# tick at every observed diameter, but label only 100..1200 by 100
+all_ticks   <- sort(unique(grp_data$Diameter))
+label_ticks <- seq(100, 1200, by = 100)
+
+scale_x_continuous(
+  breaks = all_ticks,
+  labels = function(x) ifelse(x %in% label_ticks, x, "")
+)
+
+# Generate and save plots
+for (grp in group_order) {
+  grp_data <- summary_diameter %>%
+    dplyr::filter(group == grp) %>%
+    dplyr::mutate(
+      # ensure numeric x for a true line plot
+      Diameter = as.numeric(as.character(Diameter)),
+      ymin = mean_freq - sem,
+      ymax = mean_freq + sem
+    ) %>%
+    dplyr::arrange(Diameter)
+  
+  individual_plot <- ggplot(grp_data, aes(x = Diameter, y = mean_freq)) +
+  geom_ribbon(
+    aes(ymin = ymin, ymax = ymax),
+    fill = custom_colors[[grp]],
+    alpha = 0.25,
+    color = NA
+  ) +
+  geom_line(color = custom_colors[[grp]], linewidth = 1.2) +
+  geom_point(color = custom_colors[[grp]], size = 2) +
+  {
+    all_ticks   <- sort(unique(grp_data$Diameter))
+    label_ticks <- seq(100, 1200, by = 200)
+    scale_x_continuous(
+      breaks = all_ticks,
+      labels = function(x) ifelse(x %in% label_ticks, x, "")
+    )
+  } +
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(x = "Spot Diameter (µm)", y = "Spike Frequency (Hz)", title = NULL) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14),
+    axis.text.y = element_text(size = 10),
+    axis.title.y = element_text(size = 20),
+    axis.text.x = element_text(
+                size = 20,
+                angle = 45,
+                hjust = 1,
+                vjust = 1),
+    axis.title.x = element_text(size = 20),
+    axis.ticks = element_line(size = 1.5),
+    axis.ticks.length = unit(0.4, "cm"))
+
+  individual_plots[[grp]] <- individual_plot
+    
+    
+  ggsave(
+    filename = paste0("line_diameter_plot_", gsub("-", "_", grp), ".pdf"),
+    plot = individual_plot,
+    path = save_paths[["varieddiameter_group"]],
+    width = 6,
+    height = 8,
+    dpi = 300
+  )
+}
+
+for (p in individual_plots) {
+  print(p)
+}
+
+```
+
+This plots orientation selectivity using the same calculation provided by Nath & Schwartz JNeuro 2016. 1/21/26 nl 
+```{r}
+for (i in 1:nrow(tracker)) {
+  row <- tracker[i, ]
+  
+  data_file <- file.path(
+    here("Physiology", "datfiles"),
+    row$file
+  )
+  
+  data_filename <- tools::file_path_sans_ext(basename(data_file))
+  experiment_number <- as.numeric(row$e)
+  
+  # Skip already-analyzed or invalid entries
+  if (!is.na(tracker$os_index[i])) {
+  message(paste("Skipping", tracker$file[i], "- os_index already calculated."))
+  next
+  }
+  
+  if (is.na(row$file) || is.na(row$e) || is.na(row$os))
+    next
+  
+  classification <- ifelse(is.na(row$classification), "NULL", row$classification)
+  if (tolower(classification) == "null") {
+    message(paste("Skipping", row$file, "- classification is NULL."))
+    next
+  }
+  
+  series_list_os <- as.numeric(unlist(strsplit(as.character(row$os), ",")))
+  all_frequencies <- list()
+  
+  for (series in series_list_os) {
+    data <- ImportPRecording(
+      data_file,
+      experiment = experiment_number,
+      series = series,
+      traces = 1,
+      encoding = getOption("encoding"),
+      filetype = 'PatchMaster',
+      verbose = TRUE
+    )
+    
+    timepoints <- data@TimeTrace
+    current_data_pA <- data@Data[["Imon-1"]] * 1e12
+    colnames(current_data_pA) <- as.numeric(gsub("s|:", "", colnames(current_data_pA)))
+    
+    # Spike detection
+    cutoff_high <- 0.2
+    cutoff_low <- 700
+    high_order <- 2
+    low_order <- 4
+    
+    sweeps_data <- as.data.frame(current_data_pA) %>%
+      mutate(Time = timepoints) %>%
+      pivot_longer(-Time, names_to = "Sweep", values_to = "Current") %>%
+      arrange(Sweep, Time) %>%
+      group_by(Sweep) %>%
+      group_modify( ~ {
+        time <- .x$Time
+        current <- .x$Current
+        dt <- mean(diff(time))
+        Fs <- 1 / dt
+        b_high <- signal::butter(high_order, cutoff_high / (Fs / 2), type = "high")
+        b_low <- signal::butter(low_order, cutoff_low / (Fs / 2), type = "low")
+        filtered <- signal::filtfilt(b_low, signal::filtfilt(b_high, current))
+        derivative <- c(NA, diff(filtered) / dt)
+        threshold <- max(derivative, na.rm = TRUE) * 0.5
+        spike_indices <- which(derivative > threshold)
+        refractory_samples <- round(0.002 / dt)
+        valid_spike_indices <- if (length(spike_indices) > 0) {
+          idx <- spike_indices[1]
+          for (i in spike_indices[-1]) {
+            if (i - tail(idx, 1) > refractory_samples) {
+              idx <- c(idx, i)
+            }
+          }
+          idx
+        } else
+          integer(0)
+        .x$Is_spike <- FALSE
+        .x$Is_spike[valid_spike_indices] <- TRUE
+        return(.x)
+      }) %>%
+      ungroup()
+    
+    # Spike frequency between 2.0–2.5s
+    bin_size <- 0.05
+    bins <- seq(from = 2.0, to = 2.5, by = bin_size)
+    filtered_data <- sweeps_data %>%
+      dplyr::filter(Is_spike, Time >= 2.0 & Time < 2.5) %>%
+      dplyr::mutate(Bin = cut(
+        Time,
+        breaks = bins,
+        include.lowest = TRUE,
+        right = FALSE
+      )) %>%
+      dplyr::group_by(Sweep, Bin) %>%
+      dplyr::summarise(Count = n(), .groups = 'drop') %>%
+      dplyr::mutate(Frequency = Count / bin_size)
+    
+    average_frequencies <- filtered_data %>%
+      dplyr::group_by(Sweep) %>%
+      dplyr::summarise(AvgFrequency = mean(Frequency, na.rm = TRUE),
+                       .groups = 'drop')
+    
+    all_frequencies[[as.character(series)]] <- average_frequencies
+  }
+  
+  combined_data <- bind_rows(all_frequencies) %>%
+    group_by(Sweep) %>%
+    summarise(
+      MeanFrequency = mean(AvgFrequency, na.rm = TRUE),
+      SDFrequency = sd(AvgFrequency, na.rm = TRUE),
+      SEMFrequency = sd(AvgFrequency, na.rm = TRUE) / sqrt(n())
+    )
+  
+  # --- Map sweep numbers to directions ---
+  angles <- c(210, 30, 180, 270, 330, 90, 240, 300, 60, 120, 0, 150)
+  names(angles) <- paste0(1:12)
+  combined_data$Angle <- as.numeric(angles[as.character(combined_data$Sweep)])
+  
+  # =========================
+  # OSI (DSI-analog): |Σ R(θ) e^{2 i θ}| / Σ R(θ)
+  # Preferred orientation: 0.5 * arg(Σ R(θ) e^{2 i θ})  (mod 180)
+  # =========================
+  
+  # If tuning is too weak, mark OS as NULL and skip plot
+  if (max(combined_data$MeanFrequency, na.rm = TRUE) < 5) {
+    tracker$os_index[i] <- NA
+    tracker$os_plot_peak[i] <- NA
+    message("Skipping OSI + plot (<5 Hz): ", row$file)
+    next
+  }
+  
+  # Use 12 directions (like DSI) and treat them as angles θ
+  angle_df <- combined_data %>%
+    dplyr::filter(!is.na(Angle)) %>%
+    dplyr::group_by(Angle) %>%
+    dplyr::summarise(R = mean(MeanFrequency, na.rm = TRUE),
+                     .groups = "drop") %>%
+    dplyr::arrange(Angle)
+  
+  theta_rad <- angle_df$Angle * pi / 180
+  R <- angle_df$R
+  
+  # Vector sum with doubled angles
+  vec2 <- sum(R * exp(1i * 2 * theta_rad))
+  osi <- abs(vec2) / sum(R)
+  
+  # Preferred orientation from half the phase (0..180), then map to [-90, 90] for plotting
+  theta_pref_deg <- (Arg(vec2) * 180 / pi) / 2
+  theta_pref_deg <- theta_pref_deg %% 180
+  pref_canon <- ifelse(theta_pref_deg > 90, theta_pref_deg - 180, theta_pref_deg)
+  
+  tracker$os_index[i] <- osi
+  tracker$os_plot_peak[i] <- as.numeric(pref_canon)
+  
+  
+  # --- Collapse 180°-apart replicates to canonical orientation in [-90, 90] for plotting ---
+  combined_data <- combined_data %>%
+    dplyr::mutate(Orientation = ((Angle + 90) %% 180) - 90)    # {-90,-60,-30,0,30,60,90}
+  
+  # Average replicates (two angles per orientation) and compute SEM across the replicates
+  ordered_avg_frequencies <- combined_data %>%
+    dplyr::group_by(Orientation) %>%
+    dplyr::summarise(
+      MeanFrequency = mean(MeanFrequency, na.rm = TRUE),
+      SEMFrequency  = sd(MeanFrequency, na.rm = TRUE) / sqrt(sum(!is.na(MeanFrequency))),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(Orientation)
+  
+  # --- Plot on [-90, 90] as a LINE with SEM ribbon ---
+  canon_order  <- c(-90, -60, -30, 0, 30, 60, 90)
+  canon_labels <- c("-90", "-60", "-30", "0", "30", "60", "90")
+  
+  angles_plot <- ggplot(ordered_avg_frequencies,
+                        aes(x = Orientation, y = MeanFrequency, group = 1)) +
+    geom_ribbon(
+      aes(
+        ymin = pmax(0, MeanFrequency - SEMFrequency),
+        ymax = MeanFrequency + SEMFrequency
+      ),
+      fill = "black",
+      alpha = 0.3,
+      color = NA
+    ) +
+    geom_line(color = "black") +
+    geom_point(color = "black", size = 2) +
+    geom_vline(xintercept = pref_canon,
+               linetype = "dashed",
+               color = "black") +
+    scale_x_continuous(breaks = canon_order,
+                       labels = canon_labels,
+                       limits = c(-90, 90)) +
+    scale_y_continuous(limits = c(
+      0,
+      max(ordered_avg_frequencies$MeanFrequency, na.rm = TRUE) * 1.25
+    )) +
+    labs(x = "Orientation (°)", y = "Spike frequency (spikes/s)", title = "Orientation Tuning") +
+    theme_classic() +
+    theme(
+      legend.position = "none",
+      axis.text.y  = element_text(size = 12),
+      axis.title.y = element_text(size = 20),
+      axis.text.x  = element_text(size = 12, face = "bold"),
+      axis.title.x = element_text(size = 20),
+      axis.line    = element_line(color = "black")
+    )
+  
+  plot_title    <- paste("angles_plot", data_filename, experiment_number, sep = "_")
+  full_filename <- paste0(plot_title, ".png")
+  ggsave(
+    full_filename,
+    plot = angles_plot,
+    path = save_paths[["osindex"]],
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+  
+  # (Optional) keep tidy version for pooling later
+  ordered_avg_frequencies$AngleLabel <- factor(ordered_avg_frequencies$Orientation,
+                                               levels = canon_order,
+                                               labels = canon_labels)
+  ordered_avg_frequencies$group <- paste(row$classification, row$transient_sustained, sep = "-")
+  ordered_avg_frequencies$File  <- row$file
+  
+  if (!exists("all_angles_histograms"))
+    all_angles_histograms <- list()
+  all_angles_histograms[[length(all_angles_histograms) + 1]] <- ordered_avg_frequencies
+  
+}
+
+# Load existing workbook
+wb <- openxlsx::loadWorkbook(tracker_path)
+
+# Write updated tracker data
+openxlsx::writeData(
+  wb,
+  sheet = "rawphysiology",
+  x = tracker
+)
+
+# Save workbook
+openxlsx::saveWorkbook(
+  wb,
+  tracker_path,
+  overwrite = TRUE
+)
+
+```
+
+This plots the cells preference to contrast,where it goes from 0 being grey background to 1 being full contrast stimuli. 1/21/26 nl 
+```{r}
+# Ensure required columns before loop
+if (!"contrast_plot_peak" %in% colnames(tracker)) tracker$contrast_plot_peak <- NA
+
+
+# Loop through each cell
+for (i in 1:nrow(tracker)) {
+  row <- tracker[i, ]
+
+  data_file <- file.path(
+  here("Physiology", "datfiles"),
+  row$file
+)
+  
+  data_filename <- tools::file_path_sans_ext(basename(data_file))
+  experiment_number <- as.numeric(row$e)
+
+  # Skip if missing inputs
+  if (is.na(row$file) || is.na(row$e) || is.na(row$contrast)) next
+  if (!is.na(tracker$contrast_plot_peak[i])) {
+    message(paste("Skipping", row$file, "- contrast_plot_peak already exists."))
+    next
+  }
+  if (!is.na(row$classification) && tolower(row$classification) == "null") {
+    message(paste("Skipping", row$file, "- classification is NULL."))
+    next
+  }
+
+
+  series_list_contrast <- as.numeric(unlist(strsplit(as.character(row$contrast), ",")))
+
+  all_frequencies <- list()
+
+  for (series in series_list_contrast) {
+    data <- ImportPRecording(
+      data_file,
+      experiment = experiment_number,
+      series = series,
+      traces = 1,
+      encoding = getOption("encoding"),
+      filetype = 'PatchMaster',
+      verbose = TRUE
+    )
+
+    timepoints <- data@TimeTrace
+    current_data_pA <- data@Data[["Imon-1"]] * 1e12
+    colnames(current_data_pA) <- as.numeric(gsub("s|:", "", colnames(current_data_pA)))
+
+    sweeps_data <- as.data.frame(current_data_pA) %>%
+      mutate(Time = timepoints) %>%
+      pivot_longer(-Time, names_to = "Sweep", values_to = "Current") %>%
+      arrange(Sweep, Time) %>%
+      group_by(Sweep) %>%
+      group_modify(~ {
+        time <- .x$Time
+        current <- .x$Current
+        dt <- mean(diff(time))
+        Fs <- 1 / dt
+        b_high <- signal::butter(2, 0.2 / (Fs / 2), type = "high")
+        b_low <- signal::butter(4, 700 / (Fs / 2), type = "low")
+        filtered <- signal::filtfilt(b_low, signal::filtfilt(b_high, current))
+        derivative <- c(NA, diff(filtered) / dt)
+        threshold <- max(derivative, na.rm = TRUE) * 0.5
+        spike_indices <- which(derivative > threshold)
+        refractory_samples <- round(0.002 / dt)
+        valid_spike_indices <- if (length(spike_indices) > 0) {
+          idx <- spike_indices[1]
+          for (i in spike_indices[-1]) {
+            if (i - tail(idx, 1) > refractory_samples) {
+              idx <- c(idx, i)
+            }
+          }
+          idx
+        } else integer(0)
+        .x$Is_spike <- FALSE
+        .x$Is_spike[valid_spike_indices] <- TRUE
+        return(.x)
+      }) %>%
+      ungroup()
+
+    bin_size <- 0.05
+    bins <- seq(2.0, 2.2, by = bin_size)
+    filtered_data <- sweeps_data %>%
+      dplyr::filter(Is_spike, Time >= 2.0 & Time < 2.2) %>%
+      mutate(Bin = cut(Time, breaks = bins, include.lowest = TRUE, right = FALSE)) %>%
+      group_by(Sweep, Bin) %>%
+      summarise(Count = n(), .groups = 'drop') %>%
+      mutate(Frequency = Count / bin_size)
+
+    average_frequencies <- filtered_data %>%
+      group_by(Sweep) %>%
+      summarise(AvgFrequency = mean(Frequency, na.rm = TRUE), .groups = 'drop')
+
+    all_frequencies[[as.character(series)]] <- average_frequencies
+  }
+
+  combined_data <- bind_rows(all_frequencies) %>%
+    group_by(Sweep) %>%
+    summarise(
+      MeanFrequency = mean(AvgFrequency, na.rm = TRUE),
+      SDFrequency = sd(AvgFrequency, na.rm = TRUE),
+      SEMFrequency = SDFrequency / sqrt(n())
+    )
+
+  contrast <- c(0.8, 0.2, 0.6, 0, 0.4, 1)
+  names(contrast) <- paste0(1:6)
+  combined_data$contrast <- contrast[as.character(combined_data$Sweep)]
+  ordered_avg_frequencies <- combined_data %>% arrange(contrast)
+
+  contrast_plot <- ggplot(ordered_avg_frequencies, aes(x = as.factor(contrast), y = MeanFrequency, group = 1)) +
+    geom_ribbon(aes(ymin = MeanFrequency - SEMFrequency, ymax = MeanFrequency + SEMFrequency), fill = "black", alpha = 0.3) +
+    geom_line(color = "black") +
+    geom_point(color = "black", size = 2) +
+    labs(x = "Contrast", y = "Spike frequency (spikes/s)", title = "Spike Frequency by Contrast with SEM") +
+    theme_classic() +
+    theme(
+      legend.position = "None",
+      plot.margin = margin(t = 30, r = 10, b = 10, l = 10),
+      axis.text.y = element_text(size = 12),
+      axis.title.y = element_text(size = 20),
+      axis.text.x = element_text(size = 12, face = "bold"),
+      axis.title.x = element_text(size = 20),
+      axis.line = element_line(color = "black")
+    ) +
+    scale_y_continuous(limits = c(0, max(ordered_avg_frequencies$MeanFrequency, na.rm = TRUE) * 1.25))
+
+  print(contrast_plot)
+
+  plot_title <- paste("contrast_plot", data_filename, experiment_number, sep = "_")
+  ggsave(
+    filename = paste0(plot_title, ".pdf"),
+    plot = contrast_plot,
+    device = "pdf",
+    path = save_paths[["contrast"]],
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+
+ if (nrow(ordered_avg_frequencies) > 0) {
+  message(paste("Saving contrast peak for", tracker$file[i]))
+  tracker$contrast_plot_peak[i] <- ordered_avg_frequencies$contrast[which.max(ordered_avg_frequencies$MeanFrequency)]
+ }
+  
+}
+
+# Load existing workbook
+wb <- openxlsx::loadWorkbook(tracker_path)
+
+# Write updated tracker data
+openxlsx::writeData(
+  wb,
+  sheet = "rawphysiology",
+  x = tracker
+)
+
+# Save workbook
+openxlsx::saveWorkbook(
+  wb,
+  tracker_path,
+  overwrite = TRUE
+)
+
+```
+
+This is plotting the direction selectivity index using the formula from Duan & Sanes Cell 2014. 1/21/26 nl 
+```{r}
+if (!"is_DS_ON"  %in% colnames(tracker)) tracker$is_DS_ON  <- NA
+if (!"is_DS_OFF" %in% colnames(tracker)) tracker$is_DS_OFF <- NA
+
+# Define spike detection function
+process_series <- function(series, response_type) {
+  data <- ImportPRecording(
+    data_file,
+    experiment = experiment_number,
+    series = series,
+    traces = 1,
+    encoding = getOption("encoding"),
+    filetype = 'PatchMaster',
+    verbose = TRUE
+  )
+
+  timepoints <- data@TimeTrace
+  current_data_pA <- data@Data[["Imon-1"]] * 1e12
+  colnames(current_data_pA) <- as.numeric(gsub("s|:", "", colnames(current_data_pA)))
+
+  cutoff_high <- 0.2
+  cutoff_low <- 700
+  high_order <- 2
+  low_order <- 4
+
+  sweeps_data <- as.data.frame(current_data_pA) %>%
+    mutate(Time = timepoints) %>%
+    pivot_longer(-Time, names_to = "Sweep", values_to = "Current") %>%
+    arrange(Sweep, Time) %>%
+    group_by(Sweep) %>%
+    group_modify(~ {
+      time <- .x$Time
+      current <- .x$Current
+      dt <- mean(diff(time))
+      Fs <- 1 / dt
+      b_high <- signal::butter(high_order, cutoff_high / (Fs / 2), type = "high")
+      b_low <- signal::butter(low_order, cutoff_low / (Fs / 2), type = "low")
+      filtered <- signal::filtfilt(b_low, signal::filtfilt(b_high, current))
+      derivative <- c(NA, diff(filtered) / dt)
+      threshold <- max(derivative, na.rm = TRUE) * 0.5
+      spike_indices <- which(derivative > threshold)
+      refractory_samples <- round(0.002 / dt)
+      valid_spike_indices <- if (length(spike_indices) > 0) {
+        idx <- spike_indices[1]
+        for (i in spike_indices[-1]) {
+          if (i - tail(idx, 1) > refractory_samples) {
+            idx <- c(idx, i)
+          }
+        }
+        idx
+      } else integer(0)
+      .x$Is_spike <- FALSE
+      .x$Is_spike[valid_spike_indices] <- TRUE
+      return(.x)
+    }) %>%
+    ungroup()
+
+  bin_size <- 0.05
+  bins <- seq(from = 2, to = 3, by = bin_size)
+  filtered_data <- sweeps_data %>%
+    dplyr::filter(Is_spike, Time >= 2 & Time < 3) %>%
+    dplyr::mutate(Bin = cut(Time, breaks = bins, include.lowest = TRUE, right = FALSE)) %>%
+    dplyr::group_by(Sweep, Bin) %>%
+    dplyr::summarise(Count = n(), .groups = 'drop') %>%
+    dplyr::mutate(Frequency = Count / bin_size)
+
+  average_frequencies <- filtered_data %>%
+    dplyr::group_by(Sweep) %>%
+    dplyr::summarise(AvgFrequency = mean(Frequency, na.rm = TRUE), .groups = 'drop') %>%
+    dplyr::mutate(Response = response_type)
+
+  return(average_frequencies)
+}
+
+# Main analysis loop
+for (i in 1:nrow(tracker)) {
+  row <- tracker[i, ]
+
+ data_file <- file.path(
+  here("Physiology", "datfiles"),
+  row$file
+)
+ 
+  data_filename <- tools::file_path_sans_ext(basename(data_file))
+  experiment_number <- as.numeric(row$e)
+  
+  if (is.na(tracker$file[i]) || is.na(tracker$e[i])) next
+
+  if (is.na(row$classification) || tolower(row$classification) == "null") next
+
+data_file <- file.path(
+  here("Physiology", "datfiles"),
+  row$file
+)
+  
+  data_filename <- tools::file_path_sans_ext(basename(data_file))
+  experiment_number <- as.numeric(row$e)
+  cell_class <- row$classification
+
+  series_list_ds_ON <- parse_series(row$dson)
+  series_list_ds_OFF <- parse_series(row$dsoff)
+
+  angles <- c(210, 30, 180, 270, 330, 90, 240, 300, 60, 120, 0, 150)
+  names(angles) <- paste0(1:12)
+
+  for (response_type in c("ON", "OFF")) {
+    # Skip if already analyzed
+    if ((response_type == "ON" && !is.na(tracker$dsi_on[i])) ||
+       (response_type == "OFF" && !is.na(tracker$dsi_off[i]))) next
+    
+
+    series_list <- if (response_type == "ON") series_list_ds_ON else series_list_ds_OFF
+    if ((cell_class == response_type || cell_class == "ON-OFF") && length(series_list) > 0) {
+
+      all_frequencies <- list()
+      for (series in series_list) {
+        all_frequencies[[as.character(series)]] <- process_series(series, response_type)
+      }
+
+      combined_data <- bind_rows(all_frequencies) %>%
+        group_by(Sweep) %>%
+        summarise(MeanFrequency = mean(AvgFrequency, na.rm = TRUE), .groups = 'drop')
+
+      combined_data$Angle <- angles[as.character(combined_data$Sweep)]
+
+      ordered_avg_frequencies <- combined_data %>%
+        dplyr::filter(!is.na(Angle)) %>%
+        dplyr::arrange(Angle)
+
+      plot_angles <- unique(ordered_avg_frequencies$Angle)
+
+      ############
+      # --- Vector-sum DSI (Duan 2014-style) ---
+# DSI = |Σ R(θ) e^{iθ}| / Σ R(θ)
+
+theta_rad <- ordered_avg_frequencies$Angle * pi / 180
+R <- ordered_avg_frequencies$MeanFrequency
+
+vec <- sum(R * exp(1i * theta_rad))
+DSI_value <- abs(vec) / sum(R)
+
+pref_dir_deg <- (Arg(vec) * 180 / pi) %% 360
+
+
+if (response_type == "ON")  tracker$dsi_on[i]  <- DSI_value
+if (response_type == "OFF") tracker$dsi_off[i] <- DSI_value
+
+# --- Direction selective cutoff (Duan 2014) ---
+if (response_type == "ON") {
+  tracker$is_DS_ON[i] <- !is.na(DSI_value) && DSI_value >= 0.33
+}
+
+if (response_type == "OFF") {
+  tracker$is_DS_OFF[i] <- !is.na(DSI_value) && DSI_value >= 0.33
+}
+
+
+# Optional: store preferred direction if you have columns for it
+if (response_type == "ON"  && "dsi_on_pref_dir"  %in% names(tracker)) tracker$dsi_on_pref_dir[i]  <- pref_dir_deg
+if (response_type == "OFF" && "dsi_off_pref_dir" %in% names(tracker)) tracker$dsi_off_pref_dir[i] <- pref_dir_deg
+
+      ###########
+
+      message(paste("Plotting polar plot for", data_filename, "Experiment", experiment_number, "Row", i, "Response:", response_type))
+
+
+    tryCatch({
+
+  R_max <- 100  # Radius = 100 Hz, 1.0 DSI
+
+  # If tuning is too weak, mark DS as NULL and do not plot
+  if (max(ordered_avg_frequencies$MeanFrequency, na.rm = TRUE) < 15) {
+
+    if (response_type == "ON") {
+      tracker$dsi_on[i]   <- NA
+      tracker$is_DS_ON[i] <- NA
+    } else {
+      tracker$dsi_off[i]   <- NA
+      tracker$is_DS_OFF[i] <- NA
+    }
+
+    message("Skipping plot + setting DS NULL (<5 Hz): ", data_filename, " ", response_type)
+    next
+  }
+
+  DSI_to_plot <- ifelse(response_type == "ON", tracker$dsi_on[i], tracker$dsi_off[i])
+  pref_to_plot <- pref_dir_deg  # from your vector-sum block
+
+  plot_df <- ordered_avg_frequencies %>%
+    dplyr::filter(!is.na(Angle), !is.na(MeanFrequency)) %>%
+    dplyr::mutate(
+      Angle = as.numeric(Angle) %% 360,
+      MeanFrequency = pmax(0, MeanFrequency)
+    ) %>%
+    dplyr::arrange(Angle)
+
+  # --- TRUE closure for polygon: append first point at Angle + 360 ---
+  first_pt <- plot_df[1, ]
+  first_pt$Angle <- first_pt$Angle + 360
+  plot_df_closed <- dplyr::bind_rows(plot_df, first_pt)
+
+  # DSI vector scaled into Hz space (1.0 DSI = 100 Hz)
+  dsi_len_hz <- DSI_to_plot * R_max
+  dsi_df <- data.frame(
+    Angle = (pref_to_plot %% 360),
+    r0 = 0,
+    r1 = dsi_len_hz
+  )
+
+  polar_plot <- ggplot() +
+    # polygon outline (now it will actually close)
+    geom_path(
+      data = plot_df_closed,
+      aes(x = Angle, y = MeanFrequency, group = 1),
+      color = "black",
+      linewidth = 1.3,
+      lineend = "round"
+    ) +
+    geom_point(
+      data = plot_df,
+      aes(x = Angle, y = MeanFrequency),
+      size = 2.5,
+      color = "black"
+    ) +
+    # DSI vector line (only if DSI is not NA)
+    geom_segment(
+      data = dsi_df %>% dplyr::filter(!is.na(r1)),
+      aes(x = Angle, xend = Angle, y = r0, yend = r1),
+      linewidth = 1.2,
+      color = "black"
+    ) +
+    coord_polar(start = 0) +
+    scale_x_continuous(
+      breaks = seq(0, 330, by = 30),
+      labels = function(x) paste0(x, "°"),
+      limits = c(0, 360)
+    ) +
+    scale_y_continuous(
+      limits = c(0, R_max),
+      breaks = c(0, 50, 100)
+    ) +
+    labs(
+      title = paste0(response_type, "  DSI = ", sprintf("%.2f", DSI_to_plot)),
+      x = "",
+      y = ""
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey85"),
+      legend.position = "none"
+    )
+
+  plot_title <- paste("polarplot", response_type, data_filename, experiment_number, sep = "_")
+  full_filename <- paste0(plot_title, ".png")
+  ggsave(full_filename, plot = polar_plot,
+         path = save_paths[["ds"]],
+         width = 6, height = 6, dpi = 300)
+
+}, error = function(e) {
+  message("Error in plotting for file:", data_filename, " Experiment:", experiment_number, " Response:", response_type)
+  message("Error message:", e$message)
+})
+
+
+
+    }
+  }
+}
+
+# Load existing workbook
+wb <- openxlsx::loadWorkbook(tracker_path)
+
+# Write updated tracker data
+openxlsx::writeData(
+  wb,
+  sheet = "rawphysiology",
+  x = tracker
+)
+
+# Save workbook
+openxlsx::saveWorkbook(
+  wb,
+  tracker_path,
+  overwrite = TRUE
+)
+```
+
+This is for all the stats and summary 
+```{r}
+# =========================================================
+# SAVE PATH
+# =========================================================
+save_paths[["featureselectivity"]] <- file.path(base, "featureselectivity_stats")
+save_feature <- save_paths[["featureselectivity"]]
+
+if (!dir.exists(save_feature)) {
+  dir.create(save_feature, recursive = TRUE)
+}
+
+# =========================================================
+# COLORS / GROUP ORDER
+# =========================================================
+custom_colors <- c(
+  "OFF-Transient"    = "#006b99",
+  "ON-Sustained"     = "#009967",
+  "OFF-Sustained"    = "#F58A07",
+  "ON-OFF-Sustained" = "#66C7F4",
+  "ON-OFF-Transient" = "#020887"
+)
+
+group_order <- c(
+  "ON-Sustained",
+  "OFF-Transient",
+  "OFF-Sustained",
+  "ON-OFF-Transient",
+  "ON-OFF-Sustained"
+)
+
+custom_colors <- custom_colors[group_order]
+
+onoff_groups <- c("ON-OFF-Transient", "ON-OFF-Sustained")
+
+# =========================================================
+# HEATMAP COLORS
+# =========================================================
+sig_colors <- c(
+  "****" = "#1A5A8B",
+  "***"  = "#386C9C",
+  "**"   = "#5C88B7",
+  "*"    = "#A4C8E1",
+  "ns"   = "#EEF3F7"
+)
+
+# =========================================================
+# CLEAN TRACKER
+# =========================================================
+tracker_plot <- tracker %>%
+  mutate(group = paste(classification, transient_sustained, sep = "-")) %>%
+  filter(
+    !is.na(classification),
+    !is.na(transient_sustained),
+    !(classification %in% c("NA", "NULL")),
+    !(transient_sustained %in% c("NA", "NULL")),
+    group %in% group_order
+  ) %>%
+  mutate(group = factor(group, levels = group_order)) %>%
+  droplevels()
+
+# =========================================================
+# HELPERS
+# =========================================================
+safe_pmin2 <- function(x, y) {
+  out <- pmin(x, y, na.rm = TRUE)
+  out[is.infinite(out)] <- NA_real_
+  out
+}
+
+sig_label <- function(p) {
+  case_when(
+    is.na(p) ~ NA_character_,
+    p < 1e-4 ~ "****",
+    p < 1e-3 ~ "***",
+    p < 1e-2 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+build_paired_onoff <- function(df, metric_name, on_col, off_col) {
+  df %>%
+    filter(group %in% onoff_groups) %>%
+    transmute(
+      group,
+      metric = metric_name,
+      value_on = .data[[on_col]],
+      value_off = .data[[off_col]]
+    ) %>%
+    filter(!is.na(value_on), !is.na(value_off))
+}
+
+build_group_metric <- function(df, metric_name, on_col, off_col, collapse_lookup_df) {
+  df %>%
+    left_join(
+      collapse_lookup_df %>% filter(metric == metric_name),
+      by = "group"
+    ) %>%
+    transmute(
+      group,
+      metric = metric_name,
+      value = case_when(
+        classification == "ON" ~ .data[[on_col]],
+        classification == "OFF" ~ .data[[off_col]],
+        classification == "ON-OFF" ~ .data[[on_col]],
+        TRUE ~ NA_real_
+      ),
+      collapse_to_on
+    ) %>%
+    filter(!is.na(value))
+}
+
+# =========================================================
+# OUTLIER FILTERING (IQR RULE)
+# EXEMPT METRICS: dsi, os_index
+# =========================================================
+remove_outliers_iqr_group_metric <- function(df, exempt_metrics = c("dsi", "os_index")) {
+  df %>%
+    group_by(metric, group) %>%
+    mutate(
+      Q1 = quantile(value, 0.25, na.rm = TRUE),
+      Q3 = quantile(value, 0.75, na.rm = TRUE),
+      IQR_val = IQR(value, na.rm = TRUE),
+      lower = Q1 - 1.5 * IQR_val,
+      upper = Q3 + 1.5 * IQR_val,
+      keep = case_when(
+        metric %in% exempt_metrics ~ TRUE,
+        is.na(value) ~ FALSE,
+        IQR_val == 0 ~ TRUE,
+        TRUE ~ value >= lower & value <= upper
+      )
+    ) %>%
+    ungroup()
+}
+
+remove_outliers_iqr_paired <- function(df_long, exempt_metrics = c("dsi", "os_index")) {
+  df_long %>%
+    group_by(metric, group, polarity) %>%
+    mutate(
+      Q1 = quantile(value, 0.25, na.rm = TRUE),
+      Q3 = quantile(value, 0.75, na.rm = TRUE),
+      IQR_val = IQR(value, na.rm = TRUE),
+      lower = Q1 - 1.5 * IQR_val,
+      upper = Q3 + 1.5 * IQR_val,
+      keep = case_when(
+        metric %in% exempt_metrics ~ TRUE,
+        is.na(value) ~ FALSE,
+        IQR_val == 0 ~ TRUE,
+        TRUE ~ value >= lower & value <= upper
+      )
+    ) %>%
+    ungroup()
+}
+
+# =========================================================
+# SAVE STANDALONE SIGNIFICANCE LEGEND ONCE
+# =========================================================
+legend_data <- data.frame(
+  x = 1:5,
+  y = 1,
+  sig_bin = factor(
+    c("****", "***", "**", "*", "ns"),
+    levels = c("****", "***", "**", "*", "ns")
+  )
+)
+
+legend_plot <- ggplot(legend_data, aes(x = x, y = y, fill = sig_bin)) +
+  geom_tile(color = "black") +
+  scale_fill_manual(
+    values = sig_colors,
+    drop = FALSE,
+    name = "Significance",
+    labels = c(
+      "****" = "p < 0.0001",
+      "***"  = "p < 0.001",
+      "**"   = "p < 0.01",
+      "*"    = "p < 0.05",
+      "ns"   = "ns"
+    )
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 18)
+  )
+
+legend_only <- cowplot::get_legend(legend_plot)
+
+ggsave(
+  filename = "significance_legend.pdf",
+  plot = legend_only,
+  path = save_feature,
+  width = 3,
+  height = 4,
+  dpi = 300
+)
+
+# =========================================================
+# PLOTTING FUNCTIONS
+# =========================================================
+plot_metric_groups <- function(df_long,
+                               metric_name,
+                               y_label,
+                               out_dir,
+                               file_stub = metric_name,
+                               y_limits = NULL,
+                               y_breaks = NULL) {
+
+  d <- df_long %>%
+    filter(metric == metric_name) %>%
+    mutate(group = factor(group, levels = group_order))
+
+  if (nrow(d) == 0) {
+    return(invisible(NULL))
+  }
+
+  p <- ggplot(d, aes(x = group, y = value)) +
+    geom_boxplot(
+      aes(color = group),
+      fill = "white",
+      outlier.shape = NA,
+      linewidth = 1.25,
+      width = 0.75
+    ) +
+    geom_jitter(
+      aes(fill = group),
+      shape = 21,
+      color = "black",
+      size = 2.2,
+      stroke = 0.9,
+      alpha = 0.85,
+      width = 0.15,
+      height = 0
+    ) +
+    scale_fill_manual(values = custom_colors, drop = FALSE) +
+    scale_color_manual(values = custom_colors, drop = FALSE) +
+    labs(x = NULL, y = y_label) +
+    theme_classic() +
+    theme(
+      text = element_text(size = 30),
+      legend.position = "none",
+      plot.margin = margin(t = 30, r = 10, b = 10, l = 10),
+      axis.text.y = element_text(size = 16, color = "black"),
+      axis.title.y = element_text(size = 16),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank(),
+      axis.ticks = element_line(linewidth = 1.5, color = "black"),
+      axis.ticks.length = unit(0.4, "cm")
+    )
+
+  if (!is.null(y_breaks)) {
+    p <- p + scale_y_continuous(breaks = y_breaks)
+  }
+
+  if (!is.null(y_limits)) {
+    p <- p + coord_cartesian(ylim = y_limits, clip = "off")
+  } else {
+    p <- p + coord_cartesian(clip = "off")
+  }
+
+  print(p)
+
+  ggsave(
+    filename = paste0(file_stub, ".pdf"),
+    plot = p,
+    path = out_dir,
+    width = 10,
+    height = 6,
+    dpi = 300,
+    device = "pdf"
+  )
+
+  invisible(p)
+}
+
+plot_paired_onoff_metric <- function(df_paired_wide,
+                                     metric_name,
+                                     onoff_group,
+                                     y_label,
+                                     out_dir,
+                                     paired_results,
+                                     file_stub = paste0(metric_name, "_", onoff_group, "_onoff_paired"),
+                                     y_limits = NULL,
+                                     y_breaks = NULL) {
+
+  d_wide <- df_paired_wide %>%
+    filter(metric == metric_name, group == onoff_group) %>%
+    mutate(cell_id = row_number())
+
+  if (nrow(d_wide) == 0) {
+    return(invisible(NULL))
+  }
+
+  d_long <- d_wide %>%
+    pivot_longer(
+      cols = c(value_on, value_off),
+      names_to = "polarity",
+      values_to = "value"
+    ) %>%
+    mutate(
+      polarity = recode(polarity, value_on = "ON", value_off = "OFF"),
+      polarity = factor(polarity, levels = c("ON", "OFF"))
+    )
+
+  pval_row <- paired_results %>%
+    filter(metric == metric_name, group == onoff_group)
+
+  p_text <- if (nrow(pval_row) == 1 && !is.na(pval_row$p)) {
+    paste0("paired Wilcoxon: p = ", signif(pval_row$p, 3), " (", pval_row$p_signif, ")")
+  } else {
+    "paired Wilcoxon: NA"
+  }
+
+  p <- ggplot(d_long, aes(x = polarity, y = value, group = cell_id)) +
+    geom_line(
+      color = "grey65",
+      alpha = 0.7,
+      linewidth = 0.7
+    ) +
+    geom_point(
+      aes(fill = polarity),
+      shape = 21,
+      color = "black",
+      size = 2.8,
+      stroke = 0.9
+    ) +
+    stat_summary(
+      aes(group = 1),
+      fun = median,
+      geom = "crossbar",
+      width = 0.45,
+      fatten = 0,
+      linewidth = 0.8,
+      color = "black"
+    ) +
+    scale_fill_manual(values = c("ON" = "white", "OFF" = "grey70")) +
+    labs(
+      x = NULL,
+      y = y_label,
+      subtitle = p_text
+    ) +
+    theme_classic() +
+    theme(
+      text = element_text(size = 30),
+      legend.position = "none",
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10),
+      axis.text.y = element_text(size = 16, color = "black"),
+      axis.title.y = element_text(size = 16),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank(),
+      axis.ticks = element_line(linewidth = 1.5, color = "black"),
+      axis.ticks.length = unit(0.4, "cm")
+    )
+
+  if (!is.null(y_breaks)) {
+    p <- p + scale_y_continuous(breaks = y_breaks)
+  }
+
+  if (!is.null(y_limits)) {
+    p <- p + coord_cartesian(ylim = y_limits)
+  }
+
+  print(p)
+
+  ggsave(
+    filename = paste0(file_stub, ".pdf"),
+    plot = p,
+    path = out_dir,
+    width = 10,
+    height = 6,
+    dpi = 300,
+    device = "pdf"
+  )
+
+  invisible(p)
+}
+
+plot_metric_heatmap <- function(pairwise_df,
+                                metric_name,
+                                out_dir,
+                                file_stub = paste0(metric_name, "_heatmap")) {
+
+  heatmap_data <- pairwise_df %>%
+    filter(metric == metric_name) %>%
+    select(group1, group2, p.adj)
+
+  if (nrow(heatmap_data) == 0) {
+    return(invisible(NULL))
+  }
+
+  heatmap_data_sym <- bind_rows(
+    heatmap_data,
+    heatmap_data %>% rename(group1 = group2, group2 = group1)
+  )
+
+  diag_data <- tibble(
+    group1 = group_order,
+    group2 = group_order,
+    p.adj = 1
+  )
+
+  heatmap_data_sym <- bind_rows(heatmap_data_sym, diag_data) %>%
+    distinct(group1, group2, .keep_all = TRUE)
+
+  heatmap_long <- heatmap_data_sym %>%
+    mutate(
+      group1 = factor(group1, levels = group_order),
+      group2 = factor(group2, levels = group_order),
+      significance = case_when(
+        p.adj < 0.0001 ~ "****",
+        p.adj < 0.001  ~ "***",
+        p.adj < 0.01   ~ "**",
+        p.adj < 0.05   ~ "*",
+        TRUE           ~ ""
+      ),
+      sig_bin = case_when(
+        p.adj < 0.0001 ~ "****",
+        p.adj < 0.001  ~ "***",
+        p.adj < 0.01   ~ "**",
+        p.adj < 0.05   ~ "*",
+        TRUE           ~ "ns"
+      ),
+      sig_bin = factor(sig_bin, levels = c("****", "***", "**", "*", "ns"))
+    ) %>%
+    filter(as.numeric(group1) >= as.numeric(group2)) %>%
+    mutate(group1 = fct_rev(group1))
+
+  heatplot <- ggplot(heatmap_long, aes(x = group1, y = group2, fill = sig_bin)) +
+    geom_tile(color = "black") +
+    geom_text(aes(label = significance), color = "white", size = 5) +
+    theme_void() +
+    coord_fixed(ratio = 1) +
+    scale_fill_manual(
+      values = sig_colors,
+      drop = FALSE
+    ) +
+    theme(
+      text = element_text(size = 30),
+      legend.position = "none",
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10),
+      axis.text.y = element_text(size = 16, color = "black"),
+      axis.title.y = element_text(size = 16),
+      axis.text.x = element_text(size = 16, color = "black"),
+      axis.ticks = element_line(color = "black"),
+      panel.border = element_blank()
+    ) +
+    labs(x = NULL, y = NULL, title = NULL) +
+    scale_y_discrete(position = "left")
+
+  print(heatplot)
+
+  ggsave(
+    filename = paste0(file_stub, ".pdf"),
+    plot = heatplot,
+    path = out_dir,
+    width = 6,
+    height = 6,
+    dpi = 300,
+    device = "pdf"
+  )
+
+  invisible(heatplot)
+}
+
+# =========================================================
+# 1) PAIRED ON vs OFF TESTS WITHIN EACH ON-OFF GROUP
+# =========================================================
+paired_specs <- tribble(
+  ~metric,               ~on_col,        ~off_col,       ~label,
+  "baseline_rate_hz",    "on_baseline",  "off_baseline", "Baseline Firing Rate (Hz)",
+  "dsi",                 "dsi_on",       "dsi_off",      "Direction Selectivity Index",
+  "fp_index",            "on_fp_index",  "off_fp_index", "Final/Peak Index",
+  "peak_firing_rate_hz", "on_peak",      "off_peak",     "Peak Firing Rate (Hz)"
+)
+
+paired_onoff_long <- pmap_dfr(
+  paired_specs,
+  function(metric, on_col, off_col, label) {
+    build_paired_onoff(tracker_plot, metric, on_col, off_col)
+  }
+)
+
+write.csv(
+  paired_onoff_long,
+  file.path(save_feature, "onoff_paired_long_raw.csv"),
+  row.names = FALSE
+)
+
+paired_results <- pmap_dfr(
+  paired_specs,
+  function(metric, on_col, off_col, label) {
+    map_dfr(onoff_groups, function(g) {
+      test_df <- tracker_plot %>%
+        filter(group == g) %>%
+        transmute(
+          value_on = .data[[on_col]],
+          value_off = .data[[off_col]]
+        ) %>%
+        filter(!is.na(value_on), !is.na(value_off))
+
+      n_cells <- nrow(test_df)
+
+      if (n_cells >= 2) {
+        w <- wilcox.test(test_df$value_on, test_df$value_off, paired = TRUE, exact = FALSE)
+        p_val <- w$p.value
+      } else {
+        p_val <- NA_real_
+      }
+
+      tibble(
+        group = g,
+        metric = metric,
+        label = label,
+        n = n_cells,
+        p = p_val,
+        p_signif = sig_label(p_val),
+        collapse_to_on = if_else(!is.na(p_val) & p_val >= 0.05, TRUE, FALSE)
+      )
+    })
+  }
+)
+
+write.csv(
+  paired_results,
+  file.path(save_feature, "onoff_paired_wilcox_results_by_group.csv"),
+  row.names = FALSE
+)
+
+# =========================================================
+# 2) BUILD FINAL ACROSS-GROUP METRICS TABLE
+# =========================================================
+collapse_lookup <- paired_results %>%
+  select(group, metric, collapse_to_on)
+
+group_metrics_long <- bind_rows(
+  build_group_metric(
+    tracker_plot,
+    "baseline_rate_hz",
+    on_col = "on_baseline",
+    off_col = "off_baseline",
+    collapse_lookup_df = collapse_lookup
+  ),
+  build_group_metric(
+    tracker_plot,
+    "peak_firing_rate_hz",
+    on_col = "on_peak",
+    off_col = "off_peak",
+    collapse_lookup_df = collapse_lookup
+  ),
+  build_group_metric(
+    tracker_plot,
+    "fp_index",
+    on_col = "on_fp_index",
+    off_col = "off_fp_index",
+    collapse_lookup_df = collapse_lookup
+  ),
+  build_group_metric(
+    tracker_plot,
+    "dsi",
+    on_col = "dsi_on",
+    off_col = "dsi_off",
+    collapse_lookup_df = collapse_lookup
+  ),
+  tracker_plot %>%
+    transmute(
+      group,
+      metric = "latency_to_peak_ms",
+      value = case_when(
+        classification == "ON" ~ on_latency_to_peak,
+        classification == "OFF" ~ off_latency_to_peak,
+        classification == "ON-OFF" ~ safe_pmin2(on_latency_to_peak, off_latency_to_peak),
+        TRUE ~ NA_real_
+      )
+    ) %>%
+    filter(!is.na(value)),
+  tracker_plot %>%
+    transmute(
+      group,
+      metric = "peakdiameter",
+      value = peakdiameter
+    ) %>%
+    filter(!is.na(value)),
+  tracker_plot %>%
+    transmute(
+      group,
+      metric = "os_index",
+      value = os_index
+    ) %>%
+    filter(!is.na(value)),
+  tracker_plot %>%
+    transmute(
+      group,
+      metric = "contrast_plot_peak",
+      value = contrast_plot_peak
+    ) %>%
+    filter(!is.na(value))
+) %>%
+  mutate(
+    group = factor(group, levels = group_order),
+    metric = factor(
+      metric,
+      levels = c(
+        "latency_to_peak_ms",
+        "peak_firing_rate_hz",
+        "fp_index",
+        "baseline_rate_hz",
+        "dsi",
+        "peakdiameter",
+        "os_index",
+        "contrast_plot_peak"
+      )
+    )
+  )
+
+write.csv(
+  group_metrics_long,
+  file.path(save_feature, "group_metrics_long_raw.csv"),
+  row.names = FALSE
+)
+
+# =========================================================
+# 3) FILTER OUTLIERS FOR PLOTTING
+# =========================================================
+group_metrics_flagged <- remove_outliers_iqr_group_metric(group_metrics_long)
+
+group_metrics_long_filtered <- group_metrics_flagged %>%
+  filter(keep) %>%
+  select(group, metric, value)
+
+group_metrics_removed_outliers <- group_metrics_flagged %>%
+  filter(!keep) %>%
+  select(group, metric, value)
+
+write.csv(
+  group_metrics_long_filtered,
+  file.path(save_feature, "group_metrics_long_filtered_for_plotting.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  group_metrics_removed_outliers,
+  file.path(save_feature, "group_metrics_removed_outliers.csv"),
+  row.names = FALSE
+)
+
+paired_onoff_long_for_filter <- paired_onoff_long %>%
+  group_by(metric, group) %>%
+  mutate(cell_id = row_number()) %>%
+  ungroup() %>%
+  pivot_longer(
+    cols = c(value_on, value_off),
+    names_to = "polarity_raw",
+    values_to = "value"
+  ) %>%
+  mutate(
+    polarity = recode(polarity_raw, value_on = "ON", value_off = "OFF")
+  ) %>%
+  select(cell_id, metric, group, polarity, value)
+
+paired_onoff_flagged <- remove_outliers_iqr_paired(paired_onoff_long_for_filter)
+
+paired_onoff_long_filtered <- paired_onoff_flagged %>%
+  filter(keep) %>%
+  select(cell_id, metric, group, polarity, value) %>%
+  pivot_wider(names_from = polarity, values_from = value, names_prefix = "value_") %>%
+  filter(!is.na(value_ON), !is.na(value_OFF)) %>%
+  rename(
+    value_on = value_ON,
+    value_off = value_OFF
+  )
+
+paired_onoff_removed_outliers <- paired_onoff_flagged %>%
+  filter(!keep) %>%
+  select(cell_id, metric, group, polarity, value)
+
+write.csv(
+  paired_onoff_long_filtered,
+  file.path(save_feature, "onoff_paired_filtered_for_plotting.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  paired_onoff_removed_outliers,
+  file.path(save_feature, "onoff_paired_removed_outliers.csv"),
+  row.names = FALSE
+)
+
+# =========================================================
+# 4) SUMMARY TABLES (RAW DATA FOR STATS)
+# =========================================================
+metric_group_summary_mean_sem <- group_metrics_long %>%
+  group_by(metric, group) %>%
+  summarise(
+    n = n(),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    sem = sd / sqrt(n),
+    .groups = "drop"
+  )
+
+write.csv(
+  metric_group_summary_mean_sem,
+  file.path(save_feature, "metric_group_summary_mean_sem.csv"),
+  row.names = FALSE
+)
+
+metric_group_summary_median_iqr <- group_metrics_long %>%
+  group_by(metric, group) %>%
+  summarise(
+    n = n(),
+    median = median(value, na.rm = TRUE),
+    q1 = quantile(value, 0.25, na.rm = TRUE),
+    q3 = quantile(value, 0.75, na.rm = TRUE),
+    iqr = IQR(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(
+  metric_group_summary_median_iqr,
+  file.path(save_feature, "metric_group_summary_median_iqr.csv"),
+  row.names = FALSE
+)
+
+metric_group_summary_combined <- metric_group_summary_mean_sem %>%
+  left_join(metric_group_summary_median_iqr, by = c("metric", "group", "n")) %>%
+  mutate(
+    mean_sem = paste0(round(mean, 2), " ± ", round(sem, 2)),
+    median_iqr = paste0(round(median, 2), " (", round(q1, 2), "-", round(q3, 2), ")")
+  ) %>%
+  select(metric, group, n, mean_sem, median_iqr, mean, sem, median, q1, q3, iqr)
+
+write.csv(
+  metric_group_summary_combined,
+  file.path(save_feature, "metric_group_summary_combined.csv"),
+  row.names = FALSE
+)
+
+# =========================================================
+# CHECK ASSUMPTIONS AND RECOMMEND TEST FOR EACH METRIC
+# =========================================================
+
+library(dplyr)
+library(rstatix)
+
+test_summary <- tibble(
+  metric = character(),
+  number_of_groups = integer(),
+  min_group_n = integer(),
+  all_groups_normal = logical(),
+  levene_p = numeric(),
+  recommended_test = character(),
+  recommended_posthoc = character()
+)
+
+normality_summary <- tibble()
+
+metrics <- unique(as.character(group_metrics_long$metric))
+
+for (metric_name in metrics) {
+
+  cat("\n========================================\n")
+  cat("Checking:", metric_name, "\n")
+  cat("========================================\n")
+
+  filtered_data <- group_metrics_long %>%
+    filter(
+      metric == metric_name,
+      !is.na(value),
+      !is.na(group)
+    ) %>%
+    droplevels()
+
+  if (nrow(filtered_data) == 0) {
+    cat("No data available for", metric_name, "\n")
+    next
+  }
+
+  group_sizes <- filtered_data %>%
+    count(group, name = "n")
+
+  n_groups <- n_distinct(filtered_data$group)
+  min_group_n <- min(group_sizes$n)
+
+  print(group_sizes)
+
+  # -------------------------------------------------------
+  # Shapiro-Wilk test within each group
+  # -------------------------------------------------------
+
+  metric_normality <- filtered_data %>%
+    group_by(group) %>%
+    summarise(
+      n = n(),
+      shapiro_p = case_when(
+        n() < 3 ~ NA_real_,
+        n_distinct(value) < 2 ~ NA_real_,
+        n() > 5000 ~ NA_real_,
+        TRUE ~ tryCatch(
+          shapiro.test(value)$p.value,
+          error = function(e) NA_real_
+        )
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(metric = metric_name) %>%
+    select(metric, everything())
+
+  print(metric_normality)
+
+  normality_summary <- bind_rows(
+    normality_summary,
+    metric_normality
+  )
+
+  valid_shapiro <- metric_normality$shapiro_p[
+    !is.na(metric_normality$shapiro_p)
+  ]
+
+  # Require every included group to have a valid Shapiro result
+  # and every valid result to have p > 0.05
+  all_groups_have_shapiro <-
+    length(valid_shapiro) == n_groups
+
+  is_normal <-
+    all_groups_have_shapiro &&
+    all(valid_shapiro > 0.05)
+
+  # -------------------------------------------------------
+  # Levene's test for equality of variances
+  # -------------------------------------------------------
+
+  levene_result <- tryCatch(
+    filtered_data %>%
+      levene_test(value ~ group),
+    error = function(e) NULL
+  )
+
+  levene_p <- if (!is.null(levene_result)) {
+    levene_result$p
+  } else {
+    NA_real_
+  }
+
+  if (!is.null(levene_result)) {
+    print(levene_result)
+  } else {
+    cat("Levene's test could not be calculated.\n")
+  }
+
+  # -------------------------------------------------------
+  # Select overall and post hoc tests
+  # -------------------------------------------------------
+
+  if (!is_normal) {
+
+    if (n_groups == 2) {
+      recommended_test <- "Wilcoxon rank-sum test"
+      recommended_posthoc <- "None: only two groups"
+    } else {
+      recommended_test <- "Kruskal-Wallis"
+      recommended_posthoc <- "Dunn's test with BH correction"
+    }
+
+  } else if (!is.na(levene_p) && levene_p > 0.05) {
+
+    if (n_groups == 2) {
+      recommended_test <- "Student's two-sample t-test"
+      recommended_posthoc <- "None: only two groups"
+    } else {
+      recommended_test <- "One-way ANOVA"
+      recommended_posthoc <- "Tukey HSD"
+    }
+
+  } else {
+
+    if (n_groups == 2) {
+      recommended_test <- "Welch's two-sample t-test"
+      recommended_posthoc <- "None: only two groups"
+    } else {
+      recommended_test <- "Welch's ANOVA"
+      recommended_posthoc <- "Games-Howell"
+    }
+  }
+
+  cat(
+    "\n→ Use: ", recommended_test,
+    "\n→ Follow-up: ", recommended_posthoc,
+    "\n",
+    sep = ""
+  )
+
+  test_summary <- bind_rows(
+    test_summary,
+    tibble(
+      metric = metric_name,
+      number_of_groups = n_groups,
+      min_group_n = min_group_n,
+      all_groups_normal = is_normal,
+      levene_p = levene_p,
+      recommended_test = recommended_test,
+      recommended_posthoc = recommended_posthoc
+    )
+  )
+}
+
+write.csv(
+  normality_summary,
+  file.path(
+    save_feature,
+    "metric_group_shapiro_results.csv"
+  ),
+  row.names = FALSE
+)
+
+write.csv(
+  test_summary,
+  file.path(
+    save_feature,
+    "Statistical_Test_Recommendations.csv"
+  ),
+  row.names = FALSE
+)
+
+test_summary
+
+# =========================================================
+# 5) ACROSS-GROUP STATS (RAW DATA)
+# Kruskal-Wallis followed by Dunn's test with BH correction
+# =========================================================
+
+overall_stats <- group_metrics_long %>%
+  group_by(metric) %>%
+  kruskal_test(value ~ group) %>%
+  ungroup() %>%
+  mutate(
+    p_signif = sig_label(p)
+  )
+
+write.csv(
+  overall_stats,
+  file.path(
+    save_feature,
+    "overall_metric_kruskal_results.csv"
+  ),
+  row.names = FALSE
+)
+
+# Dunn's post hoc test with Benjamini-Hochberg correction
+pairwise_stats <- group_metrics_long %>%
+  group_by(metric) %>%
+  dunn_test(
+    value ~ group,
+    p.adjust.method = "BH"
+  ) %>%
+  ungroup() %>%
+  mutate(
+    p.adj.signif = sig_label(p.adj)
+  )
+
+write.csv(
+  pairwise_stats,
+  file.path(
+    save_feature,
+    "pairwise_metric_dunn_BH_results.csv"
+  ),
+  row.names = FALSE
+)
+
+# =========================================================
+# 6) PLOT SPECS
+# =========================================================
+plot_specs <- list(
+  latency_to_peak_ms  = list(label = "Latency to Peak (ms)", limits = c(0, 400), breaks = seq(0, 400, 100)),
+  peak_firing_rate_hz = list(label = "Peak Firing Rate (Hz)", limits = c(0, 200), breaks = seq(0, 200, 50)),
+  fp_index            = list(label = "Final/Peak Index", limits = c(-0.2, 1), breaks = seq(-0.2, 1, 0.2)),
+  baseline_rate_hz    = list(label = "Baseline Firing Rate (Hz)", limits = c(0, 60), breaks = seq(0, 60, 10)),
+  dsi                 = list(label = "Direction Selectivity Index", limits = c(0, 0.6), breaks = seq(0, 0.6, 0.1)),
+  peakdiameter        = list(label = expression("Peak Diameter" ~ "\u00B5m"), limits = c(0, 1200), breaks = seq(0, 1200, 100)),
+  os_index            = list(label = "Orientation Selectivity Index", limits = c(0, 1), breaks = seq(0, 1, 0.25)),
+  contrast_plot_peak  = list(label = "Peak Contrast", limits = c(0, 1), breaks = seq(0, 1, 0.2))
+)
+
+paired_plot_metrics <- c("baseline_rate_hz", "dsi", "fp_index", "peak_firing_rate_hz")
+
+# =========================================================
+# 7) MAKE ACROSS-GROUP PLOTS
+# =========================================================
+plot_results <- list()
+
+for (nm in names(plot_specs)) {
+  s <- plot_specs[[nm]]
+
+  plot_results[[nm]] <- plot_metric_groups(
+    df_long = group_metrics_long_filtered,
+    metric_name = nm,
+    y_label = s$label,
+    out_dir = save_feature,
+    file_stub = nm,
+    y_limits = s$limits,
+    y_breaks = s$breaks
+  )
+}
+
+# =========================================================
+# 8) MAKE HEATMAPS
+# =========================================================
+heatmap_results <- list()
+
+for (nm in names(plot_specs)) {
+  heatmap_results[[nm]] <- plot_metric_heatmap(
+    pairwise_df = pairwise_stats,
+    metric_name = nm,
+    out_dir = save_feature,
+    file_stub = paste0(nm, "_heatmap")
+  )
+}
+
+# =========================================================
+# 9) MAKE PAIRED ON vs OFF PLOTS
+# =========================================================
+paired_plot_results <- list()
+
+for (nm in paired_plot_metrics) {
+  s <- plot_specs[[nm]]
+
+  for (g in onoff_groups) {
+    paired_plot_results[[paste(nm, g, sep = "__")]] <- plot_paired_onoff_metric(
+      df_paired_wide = paired_onoff_long_filtered,
+      metric_name = nm,
+      onoff_group = g,
+      y_label = s$label,
+      out_dir = save_feature,
+      paired_results = paired_results,
+      file_stub = paste0(nm, "_", g, "_onoff_paired"),
+      y_limits = s$limits,
+      y_breaks = s$breaks
+    )
+  }
+}
+
+# =========================================================
+# 10) OPTIONAL CONSOLE OUTPUT
+# =========================================================
+paired_results
+overall_stats
+pairwise_stats
+metric_group_summary_combined
+
+stats_summary <- tibble::tribble(
+  ~Parameter, ~Comparison, ~Overall_Test, ~Posthoc_Test,
+
+  "baseline_rate_hz",    
+  "Across groups", 
+  "Kruskal-Wallis", 
+  "Dunn's test (BH)",
+
+  "peak_firing_rate_hz", 
+  "Across groups", 
+  "Kruskal-Wallis", 
+  "Dunn's test (BH)",
+
+  "fp_index",            
+  "Across groups", 
+  "Kruskal-Wallis", 
+  "Dunn's test (BH)",
+
+  "latency_to_peak_ms",  
+  "Across groups", 
+  "Kruskal-Wallis", 
+  "Dunn's test (BH)",
+
+  "dsi",                 
+  "Across groups", 
+  "Kruskal-Wallis", 
+  "Dunn's test (BH)",
+
+  "peakdiameter",        
+  "Across groups", 
+  "Kruskal-Wallis", 
+  "Dunn's test (BH)",
+
+  "os_index",            
+  "Across groups", 
+  "Kruskal-Wallis", 
+  "Dunn's test (BH)",
+
+  "contrast_plot_peak",  
+  "Across groups", 
+  "Kruskal-Wallis", 
+  "Dunn's test (BH)",
+
+  "baseline_rate_hz",    
+  "ON vs OFF within ON-OFF cells", 
+  "Paired Wilcoxon", 
+  NA,
+
+  "peak_firing_rate_hz", 
+  "ON vs OFF within ON-OFF cells", 
+  "Paired Wilcoxon", 
+  NA,
+
+  "fp_index",            
+  "ON vs OFF within ON-OFF cells", 
+  "Paired Wilcoxon", 
+  NA,
+
+  "dsi",                 
+  "ON vs OFF within ON-OFF cells", 
+  "Paired Wilcoxon", 
+  NA
+)
+
+write.csv(
+  stats_summary,
+  file.path(save_feature, "Statistical_Tests_Used.csv"),
+  row.names = FALSE
+)
+```
+

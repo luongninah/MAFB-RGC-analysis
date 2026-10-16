@@ -1,0 +1,607 @@
+---
+title: "Requirements"
+author: "Nina"
+date: "2025-01-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+extract_filename <- function(full_path) {
+  # Extract the file name from the path
+  filename <- basename(full_path)
+  
+  # Remove the file extension
+  filename_sans_ext <- tools::file_path_sans_ext(filename)
+  
+  # Extract the date and sequence part using regex
+  # This regex assumes the format is always ending with a sequence like "2024-11-21_001"
+  desired_part <- sub(".*_([0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{3})$", "\\1", filename_sans_ext)
+  
+  return(desired_part)
+}
+```
+
+```{r}
+readAny<-function (ptr, con, offset, what, size)
+{
+  seek(con, where = ptr + offset)
+  an<-readBin(con, what, size = size)
+  return(an)
+}
+```
+
+```{r}
+readlabel<-function (ptr, con, offset = 4)
+{
+  seek(con, where = ptr + offset)
+  lab<-readBin(con, "char")
+  return(lab)
+}
+```
+
+```{r}
+add_atributes<-function (tree, con, verbose = F, filename, con_pgf = con,encoding=getOption("encoding"))
+{
+  bundletree.pgf <- read.bundletree(filename, ".pgf",
+                                    con_pgf,encoding=encoding)
+  for (rootname in names(tree)) {
+    attr(tree[[c(rootname)]], "class") <- c("HEKA_treeinfo_rootnode",
+                                            "HEKA_treeinfo")
+    GRLabels <- lapply(tree[[c(rootname)]], function(item) {
+      readlabel(attr(item, "dataptr"), con)
+    })
+    attr(tree[[c(rootname)]], "names") <- paste(1:length(tree[[c(rootname)]]),
+                                                ":", GRLabels)
+    for (exp in names(tree[[rootname]])) {
+      attr(tree[[c(rootname, exp)]], "class") <- c("HEKA_treeinfo_experimentnode",
+                                                   "HEKA_treeinfo")
+      sernames <- lapply(tree[[c(rootname, exp)]], function(item) {
+        readlabel(attr(item, "dataptr"), con)
+      })
+      attr(tree[[c(rootname, exp)]], "names") <- paste(1:length(tree[[c(rootname,
+                                                                        exp)]]), ":", sernames)
+      label <- readlabel(attr(tree[[c(rootname, exp)]],
+                              "dataptr"), con)
+      expnumber <- readAny(attr(tree[[c(rootname, exp)]],
+                                "dataptr"), con, 116, "int", 4)
+      if (!label == paste0("E-", expnumber)) {
+        attr(tree[[c(rootname, exp)]], "ExperimentLabel") <- label
+      }
+      for (ser in names(tree[[c(rootname, exp)]])) {
+        attr(tree[[c(rootname, exp, ser)]], "class") <- c("HEKA_treeinfo_seriesnode",
+                                                          "HEKA_treeinfo")
+        attr(tree[[c(rootname, exp, ser)]], "path") <- c(rootname,
+                                                         exp, ser)
+        sweeplabels = lapply(tree[[c(rootname, exp, ser)]],
+                             function(item) {
+                               readlabel(attr(item, "dataptr"), con)
+                             })
+        attr(tree[[c(rootname, exp, ser)]], "names") <- paste("s",
+                                                              1:length(tree[[c(rootname, exp, ser)]]), ":",
+                                                              sweeplabels, sep = "")
+        stimcount <- readAny(attr(tree[[c(rootname, exp,
+                                          ser)]][[1]], "dataptr"), con, 40, "int",
+                             2)
+        StimName <- readAny(attr(bundletree.pgf[[stimcount]],
+                                 "dataptr"), con_pgf, 4, "char",
+                            NA)
+        attr(tree[[c(rootname, exp, ser)]], "StimulusName") <- StimName
+        label = readlabel(attr(tree[[c(rootname, exp,
+                                       ser)]], "dataptr"), con)
+        if (!label == StimName) {
+          attr(tree[[c(rootname, exp, ser)]], "SeriesLabel") <- label
+        }
+        if (verbose) {
+          for (sweep in names(tree[[c(rootname, exp,
+                                      ser)]])) {
+            attr(tree[[c(rootname, exp, ser, sweep)]],
+                 "path") <- c(rootname, exp, ser,
+                              sweep)
+            attr(tree[[c(rootname, exp, ser, sweep)]],
+                 "class") <- c("HEKA_treeinfo_sweepnode",
+                               "HEKA_treeinfo")
+            attr(tree[[c(rootname, exp, ser, sweep)]],
+                 "names") <- lapply(tree[[c(rootname,
+                                            exp, ser, sweep)]], function(trace) {
+                                              readlabel(attr(trace, "dataptr"),
+                                                        con)
+                                            })
+            for (trace in names(tree[[c(rootname, exp,
+                                        ser, sweep)]])) {
+              attr(tree[[c(rootname, exp, ser, sweep,
+                           trace)]], "path") <- c(rootname,
+                                                  exp, ser, sweep, trace)
+              attr(tree[[c(rootname, exp, ser, sweep,
+                           trace)]], "class") <- c("HEKA_treeinfo_tracenode",
+                                                   "HEKA_treeinfo")
+            }
+          }
+        }
+      }
+    }
+  }
+  tree
+}
+```
+
+```{r}
+pm_load_nodes<-function (con, nlevels, lvl_sizes, level)
+{
+  stopifnot(level <= nlevels)
+  size <- lvl_sizes[[level]]
+  dataptr <- seek(con)
+  seek(con, seek(con) + size)
+  nchildren <- readBin(con, "int", size = 4)
+  if (nchildren == 0) {
+    node <- "trace"
+    attr(node, "dataptr") <- dataptr
+  }
+  else {
+    node <- lapply(1:nchildren, function(child) {
+      pm_load_nodes(con, nlevels, lvl_sizes, level + 1)
+    })
+    attr(node, "dataptr") <- dataptr
+  }
+  node
+}
+```
+
+```{r}
+read.bundletree<-function (filename, bundlename = ".pul", con = NA,encoding=getOption("encoding"))
+{
+  name<-""
+  rm(name)
+  finally_close_con = is.na(con)
+  if (is.na(con)) {
+    con <- file(filename, "rb", encoding=encoding)
+  }
+  seek(con, 0)
+  signature <- readChar(con, 8)
+  if (signature == "DAT2") {
+    seek(con, where = 48)
+    nitems <- readBin(con, "int", size = 1)
+    seek(con, where = 64)
+    bundleitems <- do.call(rbind, (lapply(0:nitems, function(item) {
+      start <- readBin(con, "int", size = 4)
+      end <- readBin(con, "int", size = 4)
+      name <- readChar(con, 8)
+      data.frame(start = start, end = end, name = name,
+                 stringsAsFactors = F)
+    })))
+    start <- subset(bundleitems, name == bundlename)$start
+    seek(con, where = start)
+  }
+  else {
+    start <- 0
+  }
+  seek(con, where = start)
+  magic <- readChar(con, nchars = 4)
+  stopifnot(magic == "eerT")
+  nLevels <- readBin(con, "int", size = 4)
+  lvl_sizes <- lapply(1:nLevels, function(i) {
+    readBin(con, "int", size = 4)
+  })
+  tree <- pm_load_nodes(con, nLevels, lvl_sizes, 1)
+  if (finally_close_con)
+    close(con)
+  tree
+}
+```
+
+```{r}
+get_treeinfo<-function (filename, slim = F,encoding=getOption("encoding"))
+{
+  con = file(filename, "rb")
+  signature <- readChar(con, 4)
+  if (!(signature == "DAT1" || signature == "DAT2"))
+    stop("file type is not supported")
+  if (signature == "DAT1") {
+    mypul <- stringr::str_replace(filename, ".dat$",
+                                  ".pul")
+    if (!file.exists(mypul)) {
+      close(con)
+      stop("while trying to read from *.dat file, detected the old 'DAT1' format (no bundle file), therefore expected but could not find a correspoding *.pul file")
+    }
+    con_pul <- file(mypul, "rb")
+    mypgf <- stringr::str_replace(filename, ".dat$",
+                                  ".pgf")
+    if (!file.exists(mypul)) {
+      close(con)
+      stop("while trying to read from *.dat file, detected the old 'DAT1' format (no bundle file), therefore expected but could not find a correspoding *.pgf file")
+    }
+    con_pgf <- file(mypgf, "rb")
+  }
+  else {
+    con_pul = con
+    con_pgf = con
+  }
+  treeinfo <- list(root = read.bundletree(filename, ".pul",
+                                          con = con_pul,encoding=encoding))
+  attr(treeinfo[["root"]], "filename") <- filename
+  names(treeinfo) <- filename
+  class(treeinfo) <- "HEKA_treeinfo"
+  treeinfo <- add_atributes(treeinfo, con_pul, verbose = !slim,
+                            filename = filename, con_pgf = con_pgf,encoding=encoding)
+  if (signature == "DAT1") {
+    close(con_pul)
+    close(con_pgf)
+  }
+  close(con)
+  treeinfo
+}
+```
+
+Function to extract out the file name 
+```{r}
+extract_filename <- function(full_path) {
+  # Extract the file name from the path
+  filename <- basename(full_path)
+  
+  # Remove the file extension
+  filename_sans_ext <- tools::file_path_sans_ext(filename)
+  
+  # Extract the date and sequence part using regex
+  # This regex assumes the format is always ending with a sequence like "2024-11-21_001"
+  desired_part <- sub(".*_([0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{3})$", "\\1", filename_sans_ext)
+  
+  return(desired_part)
+}
+```
+
+```{r}
+ process_series <- function(series_list) {
+    all_spike_frequencies <- list()
+    for (series_number in series_list) {
+      data <- ImportPRecording(data_file, experiment_number, series_number, traces = 1)
+      timepoints <- data@TimeTrace
+      current_data_pA <- data@Data[["Imon-1"]] * 1e12
+      colnames(current_data_pA) <- as.numeric(gsub("s|:", "", colnames(current_data_pA)))
+      
+      sweeps_data <- as.data.frame(current_data_pA) %>%
+        mutate(Time = timepoints) %>%
+        pivot_longer(-Time, names_to = "Sweep", values_to = "Current") %>%
+        arrange(Sweep, Time) %>%
+        group_by(Sweep) %>%
+        group_modify(~ {
+          time <- .x$Time
+          current <- .x$Current
+          dt <- mean(diff(time))
+          Fs <- 1 / dt
+          b_high <- signal::butter(2, 0.2 / (Fs / 2), type = "high")
+          b_low <- signal::butter(4, 700 / (Fs / 2), type = "low")
+          filtered <- signal::filtfilt(b_low, signal::filtfilt(b_high, current))
+          derivative <- c(NA, diff(filtered) / dt)
+          threshold <- max(derivative, na.rm = TRUE) * 0.5
+          spike_indices <- which(derivative > threshold)
+          refractory_samples <- round(0.002 / dt)
+          valid_spike_indices <- if (length(spike_indices) > 0) {
+            idx <- spike_indices[1]
+            for (i in spike_indices[-1]) {
+              if (i - tail(idx, 1) > refractory_samples) idx <- c(idx, i)
+            }
+            idx
+          } else integer(0)
+          .x$Is_spike <- FALSE
+          .x$Is_spike[valid_spike_indices] <- TRUE
+          return(.x)
+        }) %>% ungroup()
+
+      spike_times <- sweeps_data %>%dplyr::filter(Is_spike) %>% select(Time, Sweep)
+      bin_size <- 0.05
+      bins <- seq(0, max(sweeps_data$Time, na.rm = TRUE) + bin_size, by = bin_size)
+      spike_histogram <- hist(spike_times$Time, breaks = bins, plot = FALSE)
+      spike_frequency <- (spike_histogram$counts * 20) / length(unique(sweeps_data$Sweep))
+      spike_frequency_df <- data.frame(Bin_start_time = bins[-length(bins)], Spike_frequency = spike_frequency)
+      all_spike_frequencies[[paste0("Series_", series_number)]] <- spike_frequency_df
+    }
+    return(all_spike_frequencies)
+  }
+```
+
+```{r}
+  process_series_vd <- function(series, response_type) {
+    data <- ImportPRecording(data_file,
+        experiment = experiment_number,
+        series = series,
+        traces = 1,
+        encoding = getOption("encoding"),
+        filetype = 'PatchMaster',
+        verbose = TRUE
+    )
+
+    timepoints <- data@TimeTrace
+    current_data_pA <- data@Data[["Imon-1"]] * 1e12
+    colnames(current_data_pA) <- as.numeric(gsub("s|:", "", colnames(current_data_pA)))
+
+    cutoff_high <- 0.2
+    cutoff_low <- 700
+    high_order <- 2
+    low_order <- 4
+
+    sweeps_data <- as.data.frame(current_data_pA) %>%
+      mutate(Time = timepoints) %>%
+      pivot_longer(-Time, names_to = "Sweep", values_to = "Current") %>%
+      arrange(Sweep, Time) %>%
+      group_by(Sweep) %>%
+      group_modify(~ {
+        time <- .x$Time
+        current <- .x$Current
+        dt <- mean(diff(time))
+        Fs <- 1 / dt
+        b_high <- signal::butter(high_order, cutoff_high / (Fs / 2), type = "high")
+        b_low <- signal::butter(low_order, cutoff_low / (Fs / 2), type = "low")
+        filtered <- signal::filtfilt(b_low, signal::filtfilt(b_high, current))
+        derivative <- c(NA, diff(filtered) / dt)
+        threshold <- max(derivative, na.rm = TRUE) * 0.5
+        spike_indices <- which(derivative > threshold)
+        refractory_samples <- round(0.002 / dt)
+        valid_spike_indices <- if (length(spike_indices) > 0) {
+          idx <- spike_indices[1]
+          for (i in spike_indices[-1]) {
+            if (i - tail(idx, 1) > refractory_samples) {
+              idx <- c(idx, i)
+            }
+          }
+          idx
+        } else integer(0)
+        .x$Is_spike <- FALSE
+        .x$Is_spike[valid_spike_indices] <- TRUE
+        return(.x)
+      }) %>%
+      ungroup()
+
+    bin_size <- 0.05
+    bins <- seq(from = 2.0, to = 2.5, by = bin_size)
+    filtered_data <- sweeps_data %>%
+      dplyr::filter(Is_spike, Time >= 2.0 & Time < 2.5) %>%
+      dplyr::mutate(Bin = cut(Time, breaks = bins, include.lowest = TRUE, right = FALSE)) %>%
+      dplyr::group_by(Sweep, Bin) %>%
+      dplyr::summarise(Count = n(), .groups = 'drop') %>%
+      dplyr::mutate(Frequency = Count / bin_size)
+
+    average_frequencies <- filtered_data %>%
+      dplyr::group_by(Sweep) %>%
+      dplyr::summarise(AvgFrequency = mean(Frequency, na.rm = TRUE), .groups = 'drop') %>%
+      dplyr::mutate(Response = response_type)
+
+    return(average_frequencies)
+  }
+
+```
+
+```{r}
+process_series_dsi <- function(series, response_type) {
+  data <- ImportPRecording(
+    data_file,
+    experiment = experiment_number,
+    series = series,
+    traces = 1,
+    encoding = getOption("encoding"),
+    filetype = 'PatchMaster',
+    verbose = TRUE
+  )
+
+  timepoints <- data@TimeTrace
+  current_data_pA <- data@Data[["Imon-1"]] * 1e12
+  colnames(current_data_pA) <- as.numeric(gsub("s|:", "", colnames(current_data_pA)))
+
+  cutoff_high <- 0.2
+  cutoff_low <- 700
+  high_order <- 2
+  low_order <- 4
+
+  sweeps_data <- as.data.frame(current_data_pA) %>%
+    mutate(Time = timepoints) %>%
+    pivot_longer(-Time, names_to = "Sweep", values_to = "Current") %>%
+    arrange(Sweep, Time) %>%
+    group_by(Sweep) %>%
+    group_modify(~ {
+      time <- .x$Time
+      current <- .x$Current
+      dt <- mean(diff(time))
+      Fs <- 1 / dt
+      b_high <- signal::butter(high_order, cutoff_high / (Fs / 2), type = "high")
+      b_low <- signal::butter(low_order, cutoff_low / (Fs / 2), type = "low")
+      filtered <- signal::filtfilt(b_low, signal::filtfilt(b_high, current))
+      derivative <- c(NA, diff(filtered) / dt)
+      threshold <- max(derivative, na.rm = TRUE) * 0.5
+      spike_indices <- which(derivative > threshold)
+      refractory_samples <- round(0.002 / dt)
+      valid_spike_indices <- if (length(spike_indices) > 0) {
+        idx <- spike_indices[1]
+        for (i in spike_indices[-1]) {
+          if (i - tail(idx, 1) > refractory_samples) {
+            idx <- c(idx, i)
+          }
+        }
+        idx
+      } else integer(0)
+      .x$Is_spike <- FALSE
+      .x$Is_spike[valid_spike_indices] <- TRUE
+      return(.x)
+    }) %>%
+    ungroup()
+
+  bin_size <- 0.05
+  bins <- seq(from = 2.0, to = 3, by = bin_size)
+  filtered_data <- sweeps_data %>%
+    dplyr::filter(Is_spike, Time >= 2.0 & Time < 3) %>%
+    dplyr::mutate(Bin = cut(Time, breaks = bins, include.lowest = TRUE, right = FALSE)) %>%
+    dplyr::group_by(Sweep, Bin) %>%
+    dplyr::summarise(Count = n(), .groups = 'drop') %>%
+    dplyr::mutate(Frequency = Count / bin_size)
+
+  average_frequencies <- filtered_data %>%
+    dplyr::group_by(Sweep) %>%
+    dplyr::summarise(AvgFrequency = mean(Frequency, na.rm = TRUE), .groups = 'drop') %>%
+    dplyr::mutate(Response = response_type)
+
+  return(average_frequencies)
+}
+```
+
+
+```{r}
+combine_frequencies <- function(frequencies, color) {
+    bind_rows(frequencies) %>%
+      group_by(Bin_start_time) %>%
+      summarise(
+        Average_Spike_Frequency = mean(Spike_frequency, na.rm = TRUE),
+        SDSpikeFrequency = sd(Spike_frequency, na.rm = TRUE),
+        SEMSpikeFrequency = SDSpikeFrequency / sqrt(n()),
+        Condition = color,
+        .groups = "drop"
+      )
+  }
+```
+
+```{r}
+fires <- function(peak, baseline,
+                  min_spike_hz = 1.0,
+                  delta_over_baseline = 10.0) {
+  if (is.na(peak) || is.na(baseline)) return(FALSE)
+  peak >= max(min_spike_hz, baseline + delta_over_baseline)
+}
+
+```
+
+```{r}
+amp <- function(peak, baseline) {
+  if (is.na(peak) || is.na(baseline)) return(NA_real_)
+  max(0, peak - baseline)
+}
+```
+
+```{r}
+extract_filename <- function(full_path) {
+  filename <- basename(full_path)
+  tools::file_path_sans_ext(filename)
+}
+```
+
+```{r}
+to_numeric_vector <- function(x) {
+  if (is.na(x)) return(NULL)
+  as.numeric(unlist(strsplit(as.character(x), ",")))
+}
+```
+
+```{r}
+latency_to_response <- function(df,
+                                t0 = 2,
+                                baseline_window = c(0, 1),
+                                k = 2,
+                                consecutive_bins = 2) {
+  if (nrow(df) == 0) return(NA_real_)
+
+  base_df <- df %>%
+    dplyr::filter(Bin_start_time >= baseline_window[1],
+                  Bin_start_time <  baseline_window[2])
+
+  if (nrow(base_df) == 0) return(NA_real_)
+
+  base_mean <- mean(base_df$Average_Spike_Frequency, na.rm = TRUE)
+  base_sd   <- sd(base_df$Average_Spike_Frequency, na.rm = TRUE)
+  if (!is.finite(base_mean)) return(NA_real_)
+  if (!is.finite(base_sd)) base_sd <- 0
+
+  thresh <- base_mean + k * base_sd
+
+  post_df <- df %>%
+    dplyr::filter(Bin_start_time >= t0) %>%
+    dplyr::arrange(Bin_start_time) %>%
+    dplyr::mutate(above = Average_Spike_Frequency > thresh)
+
+  if (nrow(post_df) == 0) return(NA_real_)
+
+  # Require N consecutive bins above threshold
+  r <- rle(post_df$above)
+  ends <- cumsum(r$lengths)
+  starts <- ends - r$lengths + 1
+
+  hit_idx <- which(r$values & r$lengths >= consecutive_bins)[1]
+  if (is.na(hit_idx)) return(NA_real_)
+
+  first_bin_index <- starts[hit_idx]
+  latency_ms <- (post_df$Bin_start_time[first_bin_index] - t0) * 1000
+  latency_ms
+}
+
+```
+
+```{r}
+
+get_mean_frequency <- function(df, window) {
+
+  if (nrow(df) == 0) {
+    return(NA_real_)
+  }
+
+  values <- df %>%
+    filter(
+      Bin_start_time >= window[1],
+      Bin_start_time <= window[2]
+    ) %>%
+    pull(Average_Spike_Frequency)
+
+  if (length(values) == 0 || all(is.na(values))) {
+    return(NA_real_)
+  }
+
+  mean(values, na.rm = TRUE)
+}
+
+```
+
+```{r}
+get_peak_frequency <- function(df, window) {
+
+  if (nrow(df) == 0) {
+    return(NA_real_)
+  }
+
+  values <- df %>%
+    filter(
+      Bin_start_time >= window[1],
+      Bin_start_time <= window[2]
+    ) %>%
+    pull(Average_Spike_Frequency)
+
+  if (length(values) == 0 || all(is.na(values))) {
+    return(NA_real_)
+  }
+
+  max(values, na.rm = TRUE)
+}
+
+```
+
+```{r}
+get_fp_index <- function(baseline, peak, final) {
+
+  if (
+    is.na(baseline) ||
+    is.na(peak) ||
+    is.na(final) ||
+    peak == baseline
+  ) {
+    return(NA_real_)
+  }
+
+  (final - baseline) / (peak - baseline)
+}
+```
+
+```{r}
+parse_series <- function(series_str) {
+  if (is.na(series_str))
+    return(NULL)
+  as.numeric(unlist(strsplit(as.character(series_str), ",")))
+}
+
+```
+

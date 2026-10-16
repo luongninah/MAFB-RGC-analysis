@@ -1,0 +1,531 @@
+---
+title: "Flatmount_Stratification"
+author: "Nina"
+date: "2025-07-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(slider)
+library(dplyr)
+library(here)
+```
+
+```{r}
+save <- here("Morphology","IPL Depth Script")
+
+file_path <- here("data", "rawdata.xlsx")
+
+# Function to read a sheet with the first row as column names and skip second row
+read_sheet_with_names <- function(sheet_name) {
+  raw <- read_excel(file_path, sheet = sheet_name, col_names = FALSE)
+  colnames <- raw %>% slice(1) %>% unlist() %>% as.character()
+  colnames[1] <- "Distance"
+  data <- raw %>% slice(-c(1,2))
+  names(data) <- colnames
+  data
+}
+
+# Read all 3 sheets properly
+s2s4_raw <- read_sheet_with_names("s2s4")
+gfp_raw  <- read_sheet_with_names("stratification")
+th_raw   <- read_sheet_with_names("s1")
+
+# Convert all columns except Distance to numeric
+s2s4_raw <- s2s4_raw %>% mutate(across(-Distance, as.numeric))
+gfp_raw  <- gfp_raw  %>% mutate(across(-Distance, as.numeric))
+th_raw   <- th_raw   %>% mutate(across(-Distance, as.numeric))
+
+# Scale Distance to 0–100
+scale_0_100 <- function(x) {
+  100 * (x - min(x, na.rm=TRUE)) / (max(x, na.rm=TRUE) - min(x, na.rm=TRUE))
+}
+s2s4_scaled <- s2s4_raw %>% mutate(Distance = scale_0_100(as.numeric(Distance)))
+gfp_scaled  <- gfp_raw  %>% mutate(Distance = scale_0_100(as.numeric(Distance)))
+th_scaled   <- th_raw   %>% mutate(Distance = scale_0_100(as.numeric(Distance)))
+
+# Normalize s2s4 gray values to 0–1
+gray_cols_s2s4 <- setdiff(names(s2s4_scaled), "Distance")
+s2s4_scaled[gray_cols_s2s4] <- s2s4_scaled[gray_cols_s2s4] %>%
+  map_df(~(.x - min(.x, na.rm=TRUE)) / (max(.x, na.rm=TRUE) - min(.x, na.rm=TRUE)))
+
+# Normalize GFP gray values to 0–1
+gray_cols_gfp <- setdiff(names(gfp_scaled), "Distance")
+gfp_scaled[gray_cols_gfp] <- gfp_scaled[gray_cols_gfp] %>%
+  map_df(~(.x - min(.x, na.rm=TRUE)) / (max(.x, na.rm=TRUE) - min(.x, na.rm=TRUE)))
+
+# Normalize TH gray values to 0–1
+gray_cols_th <- setdiff(names(th_scaled), "Distance")
+th_scaled[gray_cols_th] <- th_scaled[gray_cols_th] %>%
+  map_df(~(.x - min(.x, na.rm=TRUE)) / (max(.x, na.rm=TRUE) - min(.x, na.rm=TRUE)))
+
+# Pivot longer
+s2s4_long <- pivot_longer(s2s4_scaled, -Distance, names_to="Cell", values_to="s2s4_Value")
+gfp_long  <- pivot_longer(gfp_scaled,  -Distance, names_to="Cell", values_to="GFP_Value")
+th_long   <- pivot_longer(th_scaled,   -Distance, names_to="Cell", values_to="TH_Value")
+
+# Smooth s2s4
+s2s4_smoothed <- s2s4_long %>%
+  group_by(Cell) %>%
+  arrange(Distance) %>%
+  mutate(Smoothed = slide_dbl(s2s4_Value, mean, .before=1, .after=1, .complete=TRUE)) %>%
+  ungroup()
+
+# Find local maxima in s2s4
+s2s4_peaks <- s2s4_smoothed %>%
+  group_by(Cell) %>%
+  mutate(
+    lag = lag(Smoothed),
+    lead = lead(Smoothed),
+    is_peak = Smoothed > lag & Smoothed > lead
+  ) %>%
+  filter(is_peak) %>%
+  arrange(Cell, desc(Smoothed)) %>%
+  group_by(Cell) %>%
+  mutate(height_rank = row_number()) %>%
+  ungroup()
+
+# Among the 2 tallest, pick the leftmost
+first_tallest_peaks <- s2s4_peaks %>%
+  filter(height_rank <= 2) %>%
+  group_by(Cell) %>%
+  arrange(Distance) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(Cell, Peak_Distance = Distance)
+
+# Shift s2s4 distances
+s2s4_aligned <- s2s4_smoothed %>%
+  left_join(first_tallest_peaks, by="Cell") %>%
+  mutate(Aligned_Distance = Distance - Peak_Distance)
+
+# Shift GFP distances
+gfp_aligned <- gfp_long %>%
+  left_join(first_tallest_peaks, by="Cell") %>%
+  mutate(Aligned_Distance = Distance - Peak_Distance)
+
+# Shift TH distances
+th_aligned <- th_long %>%
+  left_join(first_tallest_peaks, by="Cell") %>%
+  mutate(Aligned_Distance = Distance - Peak_Distance)
+
+# Combine all for plotting
+plot_data <- bind_rows(
+  s2s4_aligned %>% mutate(Channel = "s2s4", Value = s2s4_Value),
+  gfp_aligned  %>% mutate(Channel = "GFP",  Value = GFP_Value),
+  th_aligned   %>% mutate(Channel = "TH",   Value = TH_Value)
+)
+
+# Bin width
+bin_width <- 0.2
+
+# Bin and summarize s2s4
+s2s4_binned <- plot_data %>%
+  filter(Channel == "s2s4") %>%
+  mutate(Bin = floor(Aligned_Distance / bin_width) * bin_width) %>%
+  group_by(Bin) %>%
+  summarise(
+    mean_value = mean(Value, na.rm=TRUE),
+    sem = sd(Value, na.rm=TRUE)/sqrt(n())
+  ) %>%
+  ungroup()
+
+# Bin and summarize TH
+th_binned <- plot_data %>%
+  filter(Channel == "TH") %>%
+  mutate(Bin = floor(Aligned_Distance / bin_width) * bin_width) %>%
+  group_by(Bin) %>%
+  summarise(
+    mean_value = mean(Value, na.rm=TRUE),
+    sem = sd(Value, na.rm=TRUE)/sqrt(n())
+  ) %>%
+  ungroup()
+
+# Plot
+ggplot() +
+  # s2s4 mean + SEM
+  geom_ribbon(
+    data = s2s4_binned,
+    aes(
+      x = Bin,
+      ymin = mean_value - sem,
+      ymax = mean_value + sem
+    ),
+    fill = "grey80",
+    alpha = 0.5
+  ) +
+  geom_line(
+    data = s2s4_binned,
+    aes(
+      x = Bin,
+      y = mean_value
+    ),
+    color = "grey40",
+    linewidth = 1
+  ) +
+  # TH mean + SEM
+  geom_ribbon(
+    data = th_binned,
+    aes(
+      x = Bin,
+      ymin = mean_value - sem,
+      ymax = mean_value + sem
+    ),
+    fill = "black",
+    alpha = 0.2
+  ) +
+  geom_line(
+    data = th_binned,
+    aes(
+      x = Bin,
+      y = mean_value
+    ),
+    color = "black",
+    linewidth = 1
+  ) +
+  # GFP individual lines
+  geom_line(
+    data = plot_data %>% filter(Channel == "GFP"),
+    aes(
+      x = Aligned_Distance,
+      y = Value,
+      group = Cell
+    ),
+    color = "forestgreen",
+    linewidth = 2,
+    alpha = 0.7
+  ) +
+  scale_x_continuous(
+    limits = c(-50, 50),
+    breaks = seq(-50, 50, by = 25)
+  ) +
+  labs(
+    title = "s2s4 and TH Mean ± SEM (Binned), GFP Individual Profiles",
+    x = "Aligned Distance (0 = First of 2 Tallest s2s4 Peaks)",
+    y = "Normalized Signal (0–1)"
+  ) +
+  theme_minimal()
+
+
+ggplot() +
+  # s2s4 mean + SEM
+  geom_ribbon(
+    data = s2s4_binned,
+    aes(
+      x = Bin,
+      ymin = mean_value - sem,
+      ymax = mean_value + sem
+    ),
+    fill = "grey80",
+    alpha = 0.5
+  ) +
+  geom_line(
+    data = s2s4_binned,
+    aes(
+      x = Bin,
+      y = mean_value
+    ),
+    color = "grey40",
+    linewidth = 1
+  ) +
+  # TH mean + SEM
+  geom_ribbon(
+    data = th_binned,
+    aes(
+      x = Bin,
+      ymin = mean_value - sem,
+      ymax = mean_value + sem
+    ),
+    fill = "black",
+    alpha = 0.2
+  ) +
+  geom_line(
+    data = th_binned,
+    aes(
+      x = Bin,
+      y = mean_value
+    ),
+    color = "black",
+    linewidth = 1
+  ) +
+  labs(
+    title = "s2s4 and TH Mean ± SEM (Binned), GFP Individual Profiles",
+    x = "Aligned Distance (0 = First of 2 Tallest s2s4 Peaks)",
+    y = "Normalized Signal (0–1)"
+  ) +
+  theme_minimal()+
+   scale_x_continuous(
+    limits = c(-5, 25),
+    breaks = seq(-5, 25, by = 1)
+  ) 
+```
+
+```{r}
+# Read Reconstruction sheet
+recon <- read_excel(file_path, sheet = "Reconstructions")
+
+# Inspect and ensure column names are correct
+head(recon)
+
+# Make sure "File" and "Group" exist
+# Rename File column if needed
+names(recon)[names(recon) == "File"] <- "Cell"
+
+gfp_grouped <- gfp_aligned %>%
+  left_join(recon %>% select(Cell, Assignment), by = "Cell")
+
+# Check that all cells got a group
+if (any(is.na(gfp_grouped$Assignment))) {
+  warning("Some cells did not match any Assignment!")
+}
+
+# List all unique Cell names in your gfp_aligned
+cells_in_gfp <- unique(gfp_aligned$Cell)
+
+# List all unique Cells in the reconstruction sheet
+cells_in_recon <- unique(recon$Cell)
+
+# Find which ones are missing
+missing_cells <- setdiff(cells_in_gfp, cells_in_recon)
+
+# Show them
+print("Cells in GFP data with NO matching Group:")
+print(missing_cells)
+
+
+```
+
+```{r}
+# Join Group info to aligned GFP
+gfp_grouped <- gfp_aligned %>%
+  left_join(recon %>% select(Cell, Assignment), by = "Cell") %>%
+  filter(!is.na(Assignment))
+
+# Bin and summarize within each Group
+bin_width <- 1
+
+gfp_binned_group <- gfp_grouped %>%
+  mutate(Bin = floor(Aligned_Distance / bin_width) * bin_width) %>%
+  group_by(Assignment, Bin) %>%
+  summarise(
+    mean_value = mean(GFP_Value, na.rm = TRUE),
+    sem = sd(GFP_Value, na.rm = TRUE) / sqrt(n())
+  ) %>%
+  ungroup()
+
+# Exclude Unclassified
+gfp_binned_group_filtered <- gfp_binned_group %>%
+  filter(Assignment != "Unclassified")
+
+custom_colors <- c(
+  "Alpha ON" = "#009967",       
+  "Alpha OFF" = "#006b99",      
+  "Asymmetric" = "#1b0099",     
+  "Non-Alpha" = "#540099",      
+  "Equal Bistratified" = "#950099",  
+  "Unequal Bistratified" = "#990032" 
+)
+
+gfp_binned_group_filtered$Assignment <- factor(
+  gfp_binned_group_filtered$Assignment,
+  levels = c(
+    "Alpha ON",
+    "Alpha OFF",
+    "Asymmetric",
+    "Non-Alpha",
+    "Equal Bistratified",
+    "Unequal Bistratified"
+  )
+)
+
+s2s4_binned$Assignment <- "s2s4"
+th_binned$Assignment <- "TH"
+ref_binned <- bind_rows(s2s4_binned, th_binned)
+stratification_refs <- ggplot() +
+  geom_ribbon(
+    data = ref_binned,
+    aes(
+      x = Bin,
+      ymin = mean_value - sem,
+      ymax = mean_value + sem,
+      fill = Assignment
+    ),
+    alpha = 0.3
+  ) +
+  geom_line(
+    data = ref_binned,
+    aes(
+      x = Bin,
+      y = mean_value,
+      color = Assignment
+    ),
+    linewidth = 2
+  ) +
+  scale_color_manual(values = c("s2s4" = "grey40", "TH" = "black")) +
+  scale_fill_manual(values = c("s2s4" = "grey80", "TH" = "black")) +
+  scale_x_continuous(
+    limits = c(-15, 25),
+    breaks = seq(-15, 25, by = 15)
+  ) +
+  labs(
+    title = NULL,
+    x = "Aligned Distance",
+    y = "Normalized Signal"
+  ) +
+  theme_classic() +
+  theme(
+    strip.text = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    legend.position = "none"
+  ) +
+  coord_flip() +
+  facet_wrap(~ Assignment, nrow = 1)
+
+stratification_refs
+
+ggsave("stratification_ref.pdf", plot = stratification_refs, path = save, width = 8, height = 3, dpi = 300)
+
+
+```
+
+```{r}
+# Join Group info to aligned GFP
+gfp_grouped <- gfp_aligned %>%
+  left_join(recon %>% select(Cell, Assignment), by = "Cell") %>%
+  filter(!is.na(Assignment), Assignment != "Unclassified")
+
+bin_width <- 1
+
+# First: bin each individual cell
+gfp_binned_cell <- gfp_grouped %>%
+  mutate(Bin = floor(Aligned_Distance / bin_width) * bin_width) %>%
+  group_by(Assignment, Cell, Bin) %>%
+  summarise(
+    value = mean(GFP_Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Then: calculate group mean + SEM from the individual cell-binned values
+gfp_binned_group <- gfp_binned_cell %>%
+  group_by(Assignment, Bin) %>%
+  summarise(
+    mean_value = mean(value, na.rm = TRUE),
+    sem = sd(value, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+custom_colors <- c(
+  "Alpha ON" = "#009967",       
+  "Alpha OFF" = "#006b99",      
+  "Asymmetric" = "#1b0099",     
+  "Non-Alpha" = "#540099",      
+  "Equal Bistratified" = "#950099",  
+  "Unequal Bistratified" = "#990032" 
+)
+
+group_levels <- c(
+  "Alpha ON",
+  "Alpha OFF",
+  "Asymmetric",
+  "Non-Alpha",
+  "Equal Bistratified",
+  "Unequal Bistratified"
+)
+
+gfp_binned_cell$Assignment <- factor(gfp_binned_cell$Assignment, levels = group_levels)
+gfp_binned_group$Assignment <- factor(gfp_binned_group$Assignment, levels = group_levels)
+
+stratification <- ggplot() +
+  # group SEM ribbon
+  geom_ribbon(
+    data = gfp_binned_group,
+    aes(
+      x = Bin,
+      ymin = mean_value - sem,
+      ymax = mean_value + sem,
+      fill = Assignment
+    ),
+    alpha = 0.25
+  ) +
+  # group mean line
+  geom_line(
+    data = gfp_binned_group,
+    aes(
+      x = Bin,
+      y = mean_value,
+      color = Assignment
+    ),
+    linewidth = 2
+  ) +
+  scale_color_manual(values = custom_colors) +
+  scale_fill_manual(values = custom_colors) +
+  scale_x_continuous(
+    limits = c(-15, 25),
+    breaks = seq(-15, 25, by = 15)
+  ) +
+  labs(
+    x = "Aligned Distance",
+    y = "Normalized Signal",
+    color = "Assignment",
+    fill = "Assignment"
+  ) +
+  theme_classic() +
+  theme(
+    strip.text = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    legend.position = "none"
+  ) +
+  coord_flip() +
+  facet_wrap(~ Assignment, nrow = 1)
+
+stratification
+
+ggsave("stratification.pdf", plot = stratification, path = save, width = 8.25, height = 3, dpi = 300)
+
+```
+
+```{r}
+# Vector to control display/order
+levels_vec <- c(
+  "Alpha ON",
+  "Alpha OFF",
+  "Asymmetric",
+  "Non-Alpha",
+  "Equal Bistratified",
+  "Unequal Bistratified"
+)
+
+# Count unique Cells per Group from your joined data
+group_counts <- gfp_aligned %>%
+  left_join(recon %>% select(Cell, Assignment), by = "Cell") %>%
+  filter(!is.na(Assignment), Assignment != "Unclassified") %>%
+  distinct(Assignment, Cell) %>%
+  count(Assignment, name = "n") %>%
+  # keep only groups that actually appear, then order by your preferred sequence
+  mutate(Assignment = factor(Assignment, levels = levels_vec)) %>%
+  arrange(Assignment)
+
+# Build and print the message
+parts <- paste0(as.character(group_counts$Assignment), " (n=", group_counts$n, ")")
+total_n <- sum(group_counts$n)
+
+cat("Groups and sample sizes: ", paste(parts, collapse = ", "),
+    sprintf(" | Total N = %d\n", total_n), sep = "")
+
+```
+
+
+
+

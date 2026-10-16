@@ -1,0 +1,108 @@
+---
+title: "Retinorecipient_Analysis"
+author: "Nina"
+date: "2025-12-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(here)
+```
+
+```{r}
+save <- here("Retinorecipient","OPN")
+dir.create(save, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+data <- read_excel(
+  here("data", "rawdata.xlsx"),
+  sheet = "opn fig6e")
+
+
+subtype_cols <- c(
+  "gfp_only",
+  "gfp_spp1_calb1",
+  "gfp_spp1_meis2",
+  "gfp_calb1",
+  "gfp_meis2"
+)
+
+first_col <- names(data)[1]
+
+opn_clean <- data %>%
+  filter(.data[[first_col]] != "subtype") %>%    # drop the metadata row
+  mutate(across(all_of(subtype_cols), as.numeric))
+
+
+subtype_totals <- opn_clean %>%
+  select(all_of(subtype_cols)) %>%
+  summarise(across(everything(), sum, na.rm = TRUE)) %>%
+  pivot_longer(cols = everything(),
+               names_to = "subtype_orig",
+               values_to = "count") %>%
+  mutate(
+    subtype = case_when(
+      subtype_orig == "gfp_only" ~ "c23_c39",
+      subtype_orig == "gfp_spp1_calb1" ~ "c43",
+      subtype_orig == "gfp_spp1_meis2" ~ "c45",
+      subtype_orig == "gfp_calb1" ~ "c30",
+      subtype_orig == "gfp_meis2" ~ "c34",
+      TRUE ~ subtype_orig
+    ),
+    percentage = count / sum(count) * 100
+  )
+
+custom_colors <- c(
+  "c23_c39" = "#B0B0B0",  # light grey
+  "c30"     = "#999999",  # medium grey
+  "c34"     = "#808080",  # darker grey
+  "c43"     = "#009967",  # dark teal blue
+  "c45"     = "#006B99" # green
+)
+
+
+opnplot <- ggplot(subtype_totals, aes(x = subtype, y = percentage, fill = subtype)) +
+  geom_col(width = 1, color = "white") +
+  scale_fill_manual(values = custom_colors) +
+  geom_text(
+    aes(label = paste0(round(percentage, 1), "%")),
+    vjust = -0.3,
+    size = 10
+  ) +
+  labs(
+    x = NULL,
+    y = "Observed frequency %",
+    title = NULL
+  ) +   
+  theme_classic() +
+    labs(title = NULL, x = NULL) +
+  theme(
+      text = element_text(size = 30),
+      legend.position = "none",
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10),
+      axis.text.y = element_text(size = 16, color = "black"),
+      axis.title.y = element_text(size = 16),
+      axis.text.x = element_text(size = 16, color = "black"),
+      axis.ticks = element_line(size = 1.5, color = "black"),
+      axis.ticks.length = unit(0.4, "cm"))+
+  scale_y_continuous(limits = c(0,80))
+
+opnplot
+
+ggsave("opninjection.pdf",
+       plot = opnplot,
+       path = save,
+       device = pdf,
+       width = 10,
+       height = 6,
+       dpi = 300)
+
+```
+

@@ -1,0 +1,274 @@
+---
+title: "ProcessingImages"
+author: "Nina"
+date: "2023-08-30"
+output: html_document
+---
+
+This code I want to try to do loops, where it just takes a dynamic name and changes it. 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load necessary library
+library(imager)
+library(dplyr)
+library(readr)
+library(here)
+library(tidyverse)
+```
+
+```{r}
+# All animals to process
+IDs <- c("ID1", "ID3", "ID6", "ID7", "IDWT")
+
+# Make sure output folder exists
+if (!dir.exists(here("data"))) {
+  dir.create(here("data"))
+}
+
+for (ID in IDs) {
+  
+  message("Processing ", ID, "...")
+  
+  # ============================================================
+  # GFP / AF488
+  # ============================================================
+  
+  image_dir <- here(
+    "retinorecipient_images",
+    ID,
+    "AF488"
+  )
+  
+  jpg_files <- list.files(
+    image_dir,
+    pattern = "\\.jpg$",
+    ignore.case = TRUE
+  )
+  
+  results_df <- data.frame(
+    File = character(),
+    GFP_Presence = character()
+  )
+  
+  # Analyze each AF488 image
+  for (file in jpg_files) {
+    
+    full_path <- file.path(image_dir, file)
+    
+    img <- load.image(full_path)
+    
+    thresh_val <- 0.5
+    img_thresh <- img > thresh_val
+    
+    num_pixels_above_thresh <- sum(img_thresh)
+    
+    gfp_presence <- ifelse(
+      num_pixels_above_thresh > 100,
+      "Yes",
+      "No"
+    )
+    
+    results_df <- rbind(
+      results_df,
+      data.frame(
+        File = file,
+        GFP_Presence = gfp_presence
+      )
+    )
+    
+    rm(img, img_thresh)
+    gc()
+  }
+  
+  # Save GFP results
+  file_name_gfp <- here(
+    "data",
+    paste0(
+      "GFP_Presence_Results_",
+      ID,
+      ".csv"
+    )
+  )
+  
+  write.csv(
+    results_df,
+    file_name_gfp,
+    row.names = FALSE
+  )
+  
+  
+  # ============================================================
+  # CTB / AF647
+  # ============================================================
+  
+  ctb_image_dir <- here(
+    "retinorecipient_images",
+    ID,
+    "AF647"
+  )
+  
+  ctb_jpg_files <- list.files(
+    ctb_image_dir,
+    pattern = "\\.jpg$",
+    ignore.case = TRUE
+  )
+  
+  ctb_results_df <- data.frame(
+    File = character(),
+    CTB_Presence = character()
+  )
+  
+  # Analyze each AF647 image
+  for (file in ctb_jpg_files) {
+    
+    full_path <- file.path(
+      ctb_image_dir,
+      file
+    )
+    
+    img <- load.image(full_path)
+    
+    thresh_val <- 0.5
+    img_thresh <- img > thresh_val
+    
+    num_pixels_above_thresh <- sum(img_thresh)
+    
+    ctb_presence <- ifelse(
+      num_pixels_above_thresh > 100,
+      "Yes",
+      "No"
+    )
+    
+    ctb_results_df <- rbind(
+      ctb_results_df,
+      data.frame(
+        File = file,
+        CTB_Presence = ctb_presence
+      )
+    )
+    
+    rm(img, img_thresh)
+    gc()
+  }
+  
+  # Save CTB results
+  file_name_ctb <- here(
+    "data",
+    paste0(
+      "CTB_Presence_Results_",
+      ID,
+      ".csv"
+    )
+  )
+  
+  write.csv(
+    ctb_results_df,
+    file_name_ctb,
+    row.names = FALSE
+  )
+  
+  
+  # ============================================================
+  # MERGE GFP + CTB
+  # ============================================================
+  
+  gfp_df <- read_csv(
+    file_name_gfp,
+    show_col_types = FALSE
+  )
+  
+  ctb_df <- read_csv(
+    file_name_ctb,
+    show_col_types = FALSE
+  )
+  
+  # Remove channel identifier so corresponding sections match
+  gfp_df <- gfp_df %>%
+    mutate(
+      merge_key = gsub(
+        "_AF488",
+        "",
+        File
+      )
+    )
+  
+  ctb_df <- ctb_df %>%
+    mutate(
+      merge_key = gsub(
+        "_AF647",
+        "",
+        File
+      )
+    )
+  
+  # Match AF488 and AF647 images
+  merged_df <- inner_join(
+    gfp_df,
+    ctb_df,
+    by = "merge_key"
+  )
+  
+  # Determine sections containing both signals
+  merged_df <- merged_df %>%
+    mutate(
+      Overlap = ifelse(
+        GFP_Presence == "Yes" &
+          CTB_Presence == "Yes",
+        "Yes",
+        "No"
+      )
+    )
+  
+  
+  # ============================================================
+  # SAVE MERGED RESULTS
+  # ============================================================
+  
+  file_name_merge_all <- here(
+    "data",
+    paste0(
+      "GFP_and_CTB_Overlap_Results_",
+      ID,
+      ".csv"
+    )
+  )
+  
+  write.csv(
+    merged_df,
+    file_name_merge_all,
+    row.names = FALSE
+  )
+  
+  
+  # Keep only overlapping sections
+  overlap_df <- merged_df %>%
+    filter(Overlap == "Yes")
+  
+  file_name_merge_yes <- here(
+    "data",
+    paste0(
+      "GFP_and_CTB_Overlap_Only_",
+      ID,
+      ".csv"
+    )
+  )
+  
+  write.csv(
+    overlap_df,
+    file_name_merge_yes,
+    row.names = FALSE
+  )
+  
+  message(
+    ID,
+    " complete: ",
+    nrow(overlap_df),
+    " overlapping sections found."
+  )
+}
+```
+
+

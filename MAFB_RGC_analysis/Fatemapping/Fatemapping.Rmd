@@ -1,0 +1,425 @@
+---
+title: "Fatemapping Mafb"
+output: html_document
+date: "2025-04-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(here)
+```
+
+```{r}
+save <- here("Fatemapping")
+data <- read_excel(here("data", "fatemapping.xlsx"))
+
+```
+Inspect column names to ensure correct mapping and Map column names to match data structure in Excel file
+```{r}
+print(colnames(data))
+
+#find percentage of GFP+RBPMS+/RBPMS+ RGCs 
+data$GFP_RGCs <- (data$"GFP+ RBPMS+" / data$"RBPMS+") * 100
+
+#find percentage of tdTomato+ RGCs
+data$tdTomato_RGCs <- (data$"tdtom+RBPMS+" / data$"RBPMS+") * 100
+
+```
+now need to tidy up the data and get stats 
+```{r}
+
+# Calculate averages for all groups and their respective subgroups
+data_average_per_ID <- data %>%
+  group_by(Age, Group, ID) %>%
+  summarise(
+    RBPMS_RGCs_Avg = mean(`RBPMS+`, na.rm = TRUE),
+    GFP_RBPMS_RGCs_Avg = mean(`GFP+ RBPMS+`, na.rm = TRUE),
+    tdtom_RBPMS_RGCs_Avg = mean(`tdtom+RBPMS+`, na.rm = TRUE),
+    GFP_RGCs_Avg = mean(`GFP_RGCs`, na.rm = TRUE),
+    tdTomato_RGCs_Avg = mean(`tdTomato_RGCs`, na.rm = TRUE),
+  )
+
+# View the resulting dataset
+print(data_average_per_ID)
+
+# Calculate the average of each n by Age and Group
+data_average_by_n <- data_average_per_ID %>%
+  group_by(Age, Group) %>%  # Group by Age and Group
+  summarise(
+    RBPMS_RGCs_Avg_Mean = mean(RBPMS_RGCs_Avg, na.rm = TRUE),
+    RBPMS_RGCs_Avg_SD = sd(RBPMS_RGCs_Avg, na.rm = TRUE),
+    RBPMS_RGCs_Avg_Min = min(RBPMS_RGCs_Avg, na.rm = TRUE),
+    RBPMS_RGCs_Avg_Max = max(RBPMS_RGCs_Avg, na.rm = TRUE),
+    
+    GFP_RBPMS_RGCs_Avg_Mean = mean(GFP_RBPMS_RGCs_Avg, na.rm = TRUE),
+    GFP_RBPMS_RGCs_Avg_SD = sd(GFP_RBPMS_RGCs_Avg, na.rm = TRUE),
+    GFP_RBPMS_RGCs_Avg_Min = min(GFP_RBPMS_RGCs_Avg, na.rm = TRUE),
+    GFP_RBPMS_RGCs_Avg_Max = max(GFP_RBPMS_RGCs_Avg, na.rm = TRUE),
+    
+    tdtom_RBPMS_RGCs_Avg_Mean = mean(tdtom_RBPMS_RGCs_Avg, na.rm = TRUE),
+    tdtom_RBPMS_RGCs_Avg_SD = sd(tdtom_RBPMS_RGCs_Avg, na.rm = TRUE),
+    tdtom_RBPMS_RGCs_Avg_Min = min(tdtom_RBPMS_RGCs_Avg, na.rm = TRUE),
+    tdtom_RBPMS_RGCs_Avg_Max = max(tdtom_RBPMS_RGCs_Avg, na.rm = TRUE),
+    
+    GFP_RGCs_Avg_Mean = mean(GFP_RGCs_Avg, na.rm = TRUE),
+    GFP_RGCs_Avg_SD = sd(GFP_RGCs_Avg, na.rm = TRUE),
+    GFP_RGCs_Avg_Min = min(GFP_RGCs_Avg, na.rm = TRUE),
+    GFP_RGCs_Avg_Max = max(GFP_RGCs_Avg, na.rm = TRUE),
+    
+    tdTomato_RGCs_Avg_Mean = mean(tdTomato_RGCs_Avg, na.rm = TRUE),
+    tdTomato_RGCs_Avg_SD = sd(tdTomato_RGCs_Avg, na.rm = TRUE),
+    tdTomato_RGCs_Avg_Min = min(tdTomato_RGCs_Avg, na.rm = TRUE),
+    tdTomato_RGCs_Avg_Max = max(tdTomato_RGCs_Avg, na.rm = TRUE),
+    .groups = "drop"  # Drop grouping if you don’t need it afterward
+  )
+
+# View the average of each n by Age and Group 
+print(data_average_by_n)
+
+
+
+
+# Calculate summary stats by Age 
+# Calculate summary stats per Age
+data_summary_by_age <- data_average_by_n %>%
+  group_by(Age) %>%  # Group by Age
+  summarise(
+    RBPMS_RGCs_Avg_Mean = mean(RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    RBPMS_RGCs_Avg_SD = sd(RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    RBPMS_RGCs_Avg_Min = min(RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    RBPMS_RGCs_Avg_Max = max(RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    
+    GFP_RBPMS_RGCs_Avg_Mean = mean(GFP_RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    GFP_RBPMS_RGCs_Avg_SD = sd(GFP_RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    GFP_RBPMS_RGCs_Avg_Min = min(GFP_RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    GFP_RBPMS_RGCs_Avg_Max = max(GFP_RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    
+    tdtom_RBPMS_RGCs_Avg_Mean = mean(tdtom_RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    tdtom_RBPMS_RGCs_Avg_SD = sd(tdtom_RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    tdtom_RBPMS_RGCs_Avg_Min = min(tdtom_RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    tdtom_RBPMS_RGCs_Avg_Max = max(tdtom_RBPMS_RGCs_Avg_Mean, na.rm = TRUE),
+    
+    GFP_RGCs_Avg_Mean = mean(GFP_RGCs_Avg_Mean, na.rm = TRUE),
+    GFP_RGCs_Avg_SD = sd(GFP_RGCs_Avg_Mean, na.rm = TRUE),
+    GFP_RGCs_Avg_Min = min(GFP_RGCs_Avg_Mean, na.rm = TRUE),
+    GFP_RGCs_Avg_Max = max(GFP_RGCs_Avg_Mean, na.rm = TRUE),
+    
+    tdTomato_RGCs_Avg_Mean = mean(tdTomato_RGCs_Avg_Mean, na.rm = TRUE),
+    tdTomato_RGCs_Avg_SD = sd(tdTomato_RGCs_Avg_Mean, na.rm = TRUE),
+    tdTomato_RGCs_Avg_Min = min(tdTomato_RGCs_Avg_Mean, na.rm = TRUE),
+    tdTomato_RGCs_Avg_Max = max(tdTomato_RGCs_Avg_Mean, na.rm = TRUE)
+  )
+
+# View the summary statistics by Age
+print(data_summary_by_age)
+
+
+# Perform ANOVA test on the diff age groups? 
+
+
+```
+
+```{r}
+# -----------------------------
+# Safe summary functions
+# -----------------------------
+
+safe_mean <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else mean(x)
+}
+
+safe_sd <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 2) NA_real_ else sd(x)
+}
+
+safe_min <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else min(x)
+}
+
+safe_max <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else max(x)
+}
+
+
+# -----------------------------
+# 1. Average measurements per ID
+# -----------------------------
+
+data_average_per_ID <- data %>%
+  group_by(Age, Group, ID) %>%
+  summarise(
+    RBPMS_RGCs_Avg = safe_mean(`RBPMS+`),
+    GFP_RBPMS_RGCs_Avg = safe_mean(`GFP+ RBPMS+`),
+    tdtom_RBPMS_RGCs_Avg = safe_mean(`tdtom+RBPMS+`),
+    GFP_RGCs_Avg = safe_mean(GFP_RGCs),
+    tdTomato_RGCs_Avg = safe_mean(tdTomato_RGCs),
+    .groups = "drop"
+  )
+
+print(data_average_per_ID)
+
+
+# -----------------------------
+# 2. Summary by Age and Group
+#    Statistics are calculated
+#    across IDs
+# -----------------------------
+
+data_average_by_group <- data_average_per_ID %>%
+  group_by(Age, Group) %>%
+  summarise(
+    across(
+      c(
+        RBPMS_RGCs_Avg,
+        GFP_RBPMS_RGCs_Avg,
+        tdtom_RBPMS_RGCs_Avg,
+        GFP_RGCs_Avg,
+        tdTomato_RGCs_Avg
+      ),
+      list(
+        N = ~ sum(!is.na(.x)),
+        Mean = ~ safe_mean(.x),
+        SD = ~ safe_sd(.x),
+        Min = ~ safe_min(.x),
+        Max = ~ safe_max(.x)
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+print(data_average_by_group)
+
+
+# -----------------------------
+# 3. Summary by Age only
+#    Statistics are calculated
+#    directly across IDs
+# -----------------------------
+
+data_summary_by_age <- data_average_per_ID %>%
+  group_by(Age) %>%
+  summarise(
+    across(
+      c(
+        RBPMS_RGCs_Avg,
+        GFP_RBPMS_RGCs_Avg,
+        tdtom_RBPMS_RGCs_Avg,
+        GFP_RGCs_Avg,
+        tdTomato_RGCs_Avg
+      ),
+      list(
+        N = ~ sum(!is.na(.x)),
+        Mean = ~ safe_mean(.x),
+        SD = ~ safe_sd(.x),
+        Min = ~ safe_min(.x),
+        Max = ~ safe_max(.x)
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+print(data_summary_by_age)
+```
+Make a plot for the percentage of GFP+ RGCs
+```{r}
+# Calculate the standard deviation by Age
+data_sd_by_age <- data_average_per_ID %>%
+  group_by(Age) %>%
+  summarise(
+    GFP_RGCs_Avg_Mean = mean(GFP_RGCs_Avg, na.rm = TRUE),
+    GFP_RGCs_Avg_SD = sd(GFP_RGCs_Avg, na.rm = TRUE),
+    .groups = "drop"  # Drop grouping after summarizing
+  )
+
+# View the new dataset with standard deviation by Age
+print(data_sd_by_age)
+
+
+# Plot with both the mean, standard deviation, and individual data points by n
+# Remove any rows with NA values in the Age column
+data_average_by_n <- data_average_by_n %>%
+  filter(!is.na(Age))
+
+# If using a separate dataset for error bars (data_sd_by_age), also remove NA there
+data_sd_by_age <- data_sd_by_age %>%
+  filter(!is.na(Age))
+
+# Manually define colors for each Age group
+bar_colors <- c("P0-P1" = "#90EE90",   # light green
+                "P28" = "#90EE90",     # light green
+                "P56-P58" = "#90EE90") # light green
+
+# Ensure Age is a factor with the correct order
+data_average_by_n$Age <- factor(data_average_by_n$Age, levels = c("P0-P1", "P28", "P56-P58"))
+```
+
+
+Make a plot for the percentage of tdTomato+ RGCs
+```{r}
+# 1. Pivot the data_long dataset to long format with both GFP and tdTomato means
+data_long <- data_average_by_n %>%
+  pivot_longer(
+    cols = c("GFP_RGCs_Avg_Mean", "tdTomato_RGCs_Avg_Mean"),
+    names_to = "Variable", 
+    values_to = "Value"
+  )
+
+# 2. Calculate SD for both GFP and tdTomato RGCs (already done in data_sd_by_age)
+data_sd_by_age <- data_average_per_ID %>%
+  group_by(Age) %>%
+  summarise(
+    GFP_RGCs_Avg_Mean = mean(GFP_RGCs_Avg, na.rm = TRUE),
+    GFP_RGCs_Avg_SD = sd(GFP_RGCs_Avg, na.rm = TRUE),
+    tdTomato_RGCs_Avg_Mean = mean(tdTomato_RGCs_Avg, na.rm = TRUE),
+    tdTomato_RGCs_Avg_SD = sd(tdTomato_RGCs_Avg, na.rm = TRUE),
+    .groups = "drop"  # Drop grouping after summarizing
+  )
+
+# 3. Merge the long data and SD data by Age (note: check if column names match)
+data_long_with_errorbars <- data_long %>%
+  left_join(data_sd_by_age, by = "Age")
+
+# Check the column names of the merged dataset to ensure SD columns exist
+print(colnames(data_long_with_errorbars))
+
+# 4. Create SD_value column for each variable based on the "Variable" column
+data_long_with_errorbars <- data_long_with_errorbars %>%
+  mutate(
+    SD_value = case_when(
+      Variable == "GFP_RGCs_Avg_Mean" ~ GFP_RGCs_Avg_SD.y,  # Assign GFP SD for GFP variable
+      Variable == "tdTomato_RGCs_Avg_Mean" ~ tdTomato_RGCs_Avg_SD.y,  # Assign tdTomato SD for tdTomato variable
+      TRUE ~ NA_real_  # In case something else comes up (it shouldn't)
+    )
+  )
+
+# View the result to make sure the SD_value column is correctly created
+print(data_long_with_errorbars)
+
+
+# Define colors for the variables
+bar_colors <- c("GFP_RGCs_Avg_Mean" = "#808080",  # light green for GFP
+                "tdTomato_RGCs_Avg_Mean" = "#555555")  # tomato red for tdTomato
+
+  
+   
+# Summarize the data to get the mean and SD value for each combination of Age and Variable
+data_summary <- data_long_with_errorbars %>%
+  group_by(Age, Variable) %>%
+  summarise(
+    Mean_Value = mean(Value, na.rm = TRUE),
+    SD_value = mean(SD_value, na.rm = TRUE),  # Use SD_value column here for each group
+    .groups = "drop"
+  )
+
+GFP_tdtomato_rgc_plot <- 
+  ggplot(data_summary, aes(x = Age, y = Mean_Value, fill = Variable, color = Variable)) +
+  geom_bar(
+    stat = "identity",
+    position = position_dodge(width = 0.9),
+    width = 0.8,
+    size = 3  
+  ) +
+  scale_fill_manual(
+    values = bar_colors,
+    labels = c(
+      expression(paste("GFP+ RGCs that transiently expressed ", italic("Mafb"))),
+      expression(paste("mCherry+ RGCs that currently express ", italic("Mafb")))
+    )
+  ) +
+  scale_color_manual(values = bar_colors) +
+  geom_errorbar(
+    aes(
+      ymin = Mean_Value - SD_value,
+      ymax = Mean_Value + SD_value
+    ),
+    width = 0.5,
+    linewidth = 1.5,
+    color = "black",
+    position = position_dodge(width = 0.9)
+  ) +
+  geom_jitter(
+    data = data_long_with_errorbars,
+    aes(x = Age, y = Value, fill = Variable),
+    shape = 21,
+    size = 8,
+    stroke = 2,
+     color = "black",
+    alpha = 0.8,
+    position = position_jitterdodge(
+      jitter.width = 0.3,
+      jitter.height = 0.6,
+      dodge.width = 0.9
+    )
+  ) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    limits = c(0, 100),
+    breaks = seq(0, 100, by = 10)
+  ) +
+  labs(
+    title = NULL,
+    x = NULL,
+    y = "% colocalization with RBPMS"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14),
+    plot.margin = margin(t = 30, r = 10, b = 10, l = 10),
+    axis.text.y = element_text(size = 16, color = "black"),
+    axis.title.y = element_text(size = 20),
+    axis.text.x = element_text(size = 16, color = "black"),
+    axis.title.x = element_text(size = 20),
+    axis.ticks = element_line(size = 1.5),             # Tick thickness
+    axis.ticks.length = unit(0.4, "cm")
+  ) 
+
+# Display the plot
+GFP_tdtomato_rgc_plot
+
+
+
+
+#save file to whatever you set as your working directory
+ggsave(filename = "20250619_P0-P56_GFP_tdTomato_RGCs_plot.pdf", plot = GFP_tdtomato_rgc_plot, device = pdf, width = 10, height = 6, dpi = 300)
+
+```
+
+```{r}
+data_long_with_errorbars$Age <- factor(
+  data_long_with_errorbars$Age,
+  levels = c("P0-P1", "P28", "P56-P58")
+)
+
+gfp_data <- data_long_with_errorbars %>%
+  filter(Variable == "GFP_RGCs_Avg_Mean")
+
+tdtomato_data <- data_long_with_errorbars %>%
+  filter(Variable == "tdTomato_RGCs_Avg_Mean")
+
+anova_gfp <- aov(Value ~ Age, data = gfp_data)
+anova_tdtomato <- aov(Value ~ Age, data = tdtomato_data)
+
+# View results
+summary(anova_gfp)
+summary(anova_tdtomato)
+
+# Only run if ANOVA p < 0.05
+TukeyHSD(anova_gfp)
+TukeyHSD(anova_tdtomato)
+```
+

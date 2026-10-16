@@ -1,0 +1,1822 @@
+---
+title: "Unbiased Clustering"
+author: "Nina"
+date: "2026-07-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(factoextra)
+library(cluster)
+library(tibble)
+library(here)
+library(Rtsne)
+library(ggrepel)
+library(grid)
+```
+
+```{r}
+# ============================================================
+# Group colors
+# ============================================================
+
+group_colors <- c(
+  "Alpha ON" = "#009967",
+  "Alpha OFF" = "#006b99",
+  "Asymmetric" = "#1b0099",
+  "Non-Alpha" = "#540099",
+  "Equal Bistratified" = "#950099",
+  "Unequal Bistratified" = "#5c001e"
+)
+
+```
+
+```{r}
+save <- here("Morphology", "Clustering")
+
+data <- read_excel(
+  here("data", "rawdata.xlsx"),
+  sheet = "Reconstructions"
+)
+
+df <- data %>%
+  select(
+    File,
+    zdepth1,
+    zdepth2,
+    `function`,
+    monoorbi,
+    somaarea,
+    somadiameter,
+    df,
+    `2df`,
+    dfdiameter,
+    `2dfdiameter`,
+    combineddf,
+    equaldf,
+    normalizeddf,
+    dfpercent,
+    df1vdf2,
+    stratification,
+    asymmetry,
+    branchlengthsum,
+    branchlengthn,
+    convexhull,
+    tips,
+    zcoordinate,
+    depth,
+    density,
+    complexity,
+    stack,
+    Group,
+    min,
+    max
+  )
+
+
+# ============================================================
+# Feature sets
+# ============================================================
+
+feature_sets <- list(
+  
+  `7D` = c(
+    "somadiameter",
+    "equaldf",
+    "stratification",
+    "asymmetry",
+    "convexhull",
+    "tips"
+  ),
+  
+  `7E` = c(
+    "stratification",
+    "somadiameter",
+    "dfdiameter",
+    "2dfdiameter",
+    "asymmetry",
+    "tips"
+  ),
+  
+  `7F` = c(
+    "zdepth1",
+    "zdepth2",
+    "somadiameter",
+    "dfdiameter",
+    "2dfdiameter",
+    "asymmetry"
+  ),
+    
+    `7G` = c(
+    "stratification",
+    "somadiameter",
+    "convexhull",
+    "monoorbi",
+    "asymmetry",
+    "equaldf",
+    "branchlengthsum",
+    "branchlengthn"
+
+  )
+)
+
+
+# ============================================================
+# Empty objects
+# ============================================================
+
+clustering_summary <- data.frame()
+cluster_results <- list()
+tsne_results <- list()
+
+
+# ============================================================
+# Run analysis for each feature set
+# ============================================================
+
+for (figure_name in names(feature_sets)) {
+
+  message("\nRunning Supplemental Figure ", figure_name)
+
+  variables <- feature_sets[[figure_name]]
+
+  figure_save <- file.path(
+    save,
+    figure_name
+  )
+
+  dir.create(
+    figure_save,
+    recursive = TRUE,
+    showWarnings = FALSE
+  )
+
+
+  # ----------------------------------------------------------
+  # Prepare data
+  # ----------------------------------------------------------
+
+  analysis_df <- df %>%
+    select(
+      File,
+      Group,
+      all_of(variables)
+    ) %>%
+    filter(
+      complete.cases(across(all_of(variables)))
+    )
+
+
+  clust_data <- analysis_df %>%
+    select(all_of(variables)) %>%
+    mutate(
+      across(
+        everything(),
+        as.numeric
+      )
+    )
+
+
+  # ----------------------------------------------------------
+  # Remove zero-variance variables
+  # ----------------------------------------------------------
+
+  variable_sd <- sapply(
+    clust_data,
+    sd,
+    na.rm = TRUE
+  )
+
+  zero_variance_variables <- names(
+    variable_sd[
+      is.na(variable_sd) |
+        variable_sd == 0
+    ]
+  )
+
+
+  if (length(zero_variance_variables) > 0) {
+
+    warning(
+      figure_name,
+      ": removing zero-variance variables: ",
+      paste(
+        zero_variance_variables,
+        collapse = ", "
+      )
+    )
+
+    clust_data <- clust_data %>%
+      select(
+        -all_of(zero_variance_variables)
+      )
+
+    variables <- setdiff(
+      variables,
+      zero_variance_variables
+    )
+  }
+
+
+  # ----------------------------------------------------------
+  # PCA
+  # ----------------------------------------------------------
+
+  pca <- prcomp(
+    clust_data,
+    center = TRUE,
+    scale. = TRUE
+  )
+
+
+  variance_explained <- (
+    pca$sdev^2 /
+      sum(pca$sdev^2)
+  ) * 100
+
+  cumulative_variance <- cumsum(
+    variance_explained
+  )
+
+
+  n_pcs_80 <- which(
+    cumulative_variance >= 80
+  )[1]
+
+
+  pca_results <- as.data.frame(
+    pca$x[
+      ,
+      seq_len(n_pcs_80),
+      drop = FALSE
+    ]
+  )
+
+
+  message(
+    figure_name,
+    ": retaining ",
+    n_pcs_80,
+    " PCs explaining ",
+    round(
+      cumulative_variance[n_pcs_80],
+      2
+    ),
+    "% of the variance"
+  )
+
+
+  # ----------------------------------------------------------
+  # Save PCA variance table
+  # ----------------------------------------------------------
+
+  pca_variance_table <- data.frame(
+    PC = paste0(
+      "PC",
+      seq_along(variance_explained)
+    ),
+    variance_explained = variance_explained,
+    cumulative_variance = cumulative_variance,
+    retained = seq_along(
+      variance_explained
+    ) <= n_pcs_80
+  )
+
+
+  write.csv(
+    pca_variance_table,
+    file.path(
+      figure_save,
+      paste0(
+        figure_name,
+        "_PCA_variance.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+
+  # ----------------------------------------------------------
+  # Save PCA loadings
+  # ----------------------------------------------------------
+
+  pca_loadings <- as.data.frame(
+    pca$rotation
+  ) %>%
+    rownames_to_column(
+      "variable"
+    )
+
+
+  write.csv(
+    pca_loadings,
+    file.path(
+      figure_save,
+      paste0(
+        figure_name,
+        "_PCA_loadings.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+
+  # ----------------------------------------------------------
+  # Scree plot
+  # ----------------------------------------------------------
+
+  scree_plot <- fviz_eig(
+    pca,
+    addlabels = TRUE,
+    ylim = c(
+      0,
+      max(
+        50,
+        max(variance_explained) + 5
+      )
+    )
+  ) +
+    geom_vline(
+      xintercept = n_pcs_80,
+      linetype = "dashed"
+    ) +
+    labs(
+      title = paste0(
+        "Supplemental Figure ",
+        figure_name,
+        ": PCA Scree Plot"
+      ),
+      subtitle = paste0(
+        n_pcs_80,
+        " PCs explain ",
+        round(
+          cumulative_variance[n_pcs_80],
+          1
+        ),
+        "% of total variance"
+      )
+    ) +
+    theme_minimal()
+
+
+  ggsave(
+    filename = paste0(
+      figure_name,
+      "_scree.pdf"
+    ),
+    plot = scree_plot,
+    path = figure_save,
+    width = 8,
+    height = 6
+  )
+
+
+  # ----------------------------------------------------------
+  # PCA contribution plots
+  # ----------------------------------------------------------
+
+  for (pc_number in seq_len(n_pcs_80)) {
+
+    contribution_plot <- fviz_contrib(
+      pca,
+      choice = "var",
+      axes = pc_number,
+      xtickslab.rt = 90
+    ) +
+      labs(
+        title = paste0(
+          "Supplemental Figure ",
+          figure_name,
+          ": Contributions to PC",
+          pc_number
+        )
+      ) +
+      theme_minimal()
+
+
+    ggsave(
+      filename = paste0(
+        figure_name,
+        "_PC",
+        pc_number,
+        "_contributions.pdf"
+      ),
+      plot = contribution_plot,
+      path = figure_save,
+      width = 8,
+      height = 6
+    )
+  }
+
+
+  # ----------------------------------------------------------
+  # Define possible values of k
+  # ----------------------------------------------------------
+
+  max_k <- min(
+    10,
+    nrow(pca_results) - 1
+  )
+
+  k_values <- 2:max_k
+
+
+  # ----------------------------------------------------------
+  # Silhouette analysis
+  # ----------------------------------------------------------
+
+  distance_matrix <- dist(
+    pca_results,
+    method = "euclidean"
+  )
+
+
+  silhouette_results <- data.frame(
+    k = k_values,
+    average_silhouette_width = NA_real_
+  )
+
+
+  for (i in seq_along(k_values)) {
+
+    current_k <- k_values[i]
+
+    set.seed(123)
+
+    temporary_kmeans <- kmeans(
+      pca_results,
+      centers = current_k,
+      nstart = 50,
+      iter.max = 1000
+    )
+
+
+    silhouette_object <- silhouette(
+      temporary_kmeans$cluster,
+      distance_matrix
+    )
+
+
+    silhouette_results$average_silhouette_width[i] <-
+      mean(
+        silhouette_object[, "sil_width"]
+      )
+  }
+
+
+  silhouette_k <- silhouette_results$k[
+    which.max(
+      silhouette_results$average_silhouette_width
+    )
+  ]
+
+
+  optimal_silhouette <- max(
+    silhouette_results$average_silhouette_width
+  )
+
+
+  message(
+    figure_name,
+    ": silhouette selected k = ",
+    silhouette_k,
+    " (average width = ",
+    round(
+      optimal_silhouette,
+      3
+    ),
+    ")"
+  )
+
+
+  write.csv(
+    silhouette_results,
+    file.path(
+      figure_save,
+      paste0(
+        figure_name,
+        "_silhouette_results.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+
+  # ----------------------------------------------------------
+  # Silhouette plot
+  # ----------------------------------------------------------
+
+  silhouette_plot <- ggplot(
+    silhouette_results,
+    aes(
+      x = k,
+      y = average_silhouette_width
+    )
+  ) +
+    geom_line(
+      linewidth = 1
+    ) +
+    geom_point(
+      size = 3
+    ) +
+    geom_vline(
+      xintercept = silhouette_k,
+      linetype = "dashed"
+    ) +
+    scale_x_continuous(
+      breaks = k_values
+    ) +
+    labs(
+      title = paste0(
+        "Supplemental Figure ",
+        figure_name,
+        ": Silhouette Method"
+      ),
+      subtitle = paste0(
+        "Selected k = ",
+        silhouette_k
+      ),
+      x = "Number of clusters",
+      y = "Average silhouette width"
+    ) +
+    theme_minimal()
+
+
+  ggsave(
+    filename = paste0(
+      figure_name,
+      "_silhouette.pdf"
+    ),
+    plot = silhouette_plot,
+    path = figure_save,
+    width = 8,
+    height = 6
+  )
+
+
+  # ----------------------------------------------------------
+  # Gap statistic
+  # ----------------------------------------------------------
+
+  set.seed(123)
+
+  gap_stat <- clusGap(
+    pca_results,
+    FUNcluster = kmeans,
+    K.max = max_k,
+    B = 500,
+    nstart = 50,
+    iter.max = 1000
+  )
+
+
+  gap_k <- maxSE(
+    f = gap_stat$Tab[, "gap"],
+    SE.f = gap_stat$Tab[, "SE.sim"],
+    method = "firstSEmax"
+  )
+
+
+  selected_gap <- gap_stat$Tab[
+    gap_k,
+    "gap"
+  ]
+
+
+  message(
+    figure_name,
+    ": gap statistic selected k = ",
+    gap_k,
+    " (Gap = ",
+    round(
+      selected_gap,
+      3
+    ),
+    ")"
+  )
+
+
+  # ----------------------------------------------------------
+  # Save gap-statistic table
+  # ----------------------------------------------------------
+
+  gap_table <- as.data.frame(
+    gap_stat$Tab
+  ) %>%
+    rownames_to_column(
+      "k"
+    ) %>%
+    mutate(
+      k = as.integer(k),
+      selected = k == gap_k
+    )
+
+
+  write.csv(
+    gap_table,
+    file.path(
+      figure_save,
+      paste0(
+        figure_name,
+        "_gap_results.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+
+  # ----------------------------------------------------------
+  # Gap-statistic plot
+  # ----------------------------------------------------------
+
+  gap_plot <- fviz_gap_stat(
+    gap_stat,
+    maxSE = list(
+      method = "firstSEmax"
+    )
+  ) +
+    geom_vline(
+      xintercept = gap_k,
+      linetype = "dashed"
+    ) +
+    labs(
+      title = paste0(
+        "Supplemental Figure ",
+        figure_name,
+        ": Gap Statistic"
+      ),
+      subtitle = paste0(
+        "Selected k = ",
+        gap_k
+      ),
+      x = "Number of clusters",
+      y = "Gap statistic"
+    ) +
+    theme_minimal()
+
+
+  ggsave(
+    filename = paste0(
+      figure_name,
+      "_gap.pdf"
+    ),
+    plot = gap_plot,
+    path = figure_save,
+    width = 8,
+    height = 6
+  )
+
+
+  # ----------------------------------------------------------
+  # Final clustering
+  # Uses gap-statistic-selected k
+  # ----------------------------------------------------------
+
+  set.seed(123)
+
+  final_kmeans <- kmeans(
+    pca_results,
+    centers = gap_k,
+    nstart = 50,
+    iter.max = 1000
+  )
+
+
+  cluster_assignments <- bind_cols(
+    analysis_df %>%
+      select(
+        File,
+        Group
+      ),
+    pca_results
+  ) %>%
+    mutate(
+      cluster = factor(
+        final_kmeans$cluster
+      )
+    )
+
+
+  cluster_results[[figure_name]] <- cluster_assignments
+
+
+  write.csv(
+    cluster_assignments,
+    file.path(
+      figure_save,
+      paste0(
+        figure_name,
+        "_cluster_assignments.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+  # ----------------------------------------------------------
+# Stacked bar plot: group composition within each cluster
+# ----------------------------------------------------------
+
+cluster_composition <- cluster_assignments %>%
+  filter(!is.na(Group)) %>%
+  count(
+    cluster,
+    Group,
+    name = "n_cells"
+  )
+
+
+cluster_composition_plot <- ggplot(
+  cluster_composition,
+  aes(
+    x = cluster,
+    y = n_cells,
+    fill = Group
+  )
+) +
+  geom_col(
+    color = "black",
+    linewidth = 0.4
+  ) +
+  scale_fill_manual(
+    values = group_colors,
+    drop = FALSE
+  ) +
+  labs(
+    title = paste0(
+      "Supplemental Figure ",
+      figure_name,
+      ": Group Composition by Cluster"
+    ),
+    subtitle = paste0(
+      "Gap-selected k = ",
+      gap_k
+    ),
+    x = "Cluster assignment",
+    y = "Number of cells",
+    fill = "Group"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(size = 16),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14),
+    axis.title = element_text(size = 16),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  )
+
+
+print(cluster_composition_plot)
+
+
+ggsave(
+  filename = paste0(
+    figure_name,
+    "_cluster_group_composition.pdf"
+  ),
+  plot = cluster_composition_plot,
+  path = figure_save,
+  width = 9,
+  height = 7
+)
+
+  # ----------------------------------------------------------
+  # Cluster-by-group table
+  # ----------------------------------------------------------
+
+  cluster_group_table <- table(
+    Group = cluster_assignments$Group,
+    Cluster = cluster_assignments$cluster
+  )
+
+
+  write.csv(
+    as.data.frame.matrix(
+      cluster_group_table
+    ),
+    file.path(
+      figure_save,
+      paste0(
+        figure_name,
+        "_cluster_by_group.csv"
+      )
+    )
+  )
+
+
+  # ----------------------------------------------------------
+  # Cluster plot
+  # ----------------------------------------------------------
+
+  plot_df <- cluster_assignments
+
+
+  if (!"PC2" %in% names(plot_df)) {
+    plot_df$PC2 <- 0
+  }
+
+
+  x_label <- paste0(
+    "PC1 (",
+    round(
+      variance_explained[1],
+      1
+    ),
+    "%)"
+  )
+
+
+  if (n_pcs_80 >= 2) {
+
+    y_label <- paste0(
+      "PC2 (",
+      round(
+        variance_explained[2],
+        1
+      ),
+      "%)"
+    )
+
+  } else {
+
+    y_label <- "PC2"
+  }
+
+
+  cluster_plot <- ggplot(
+    plot_df,
+    aes(
+      x = PC1,
+      y = PC2,
+      color = cluster
+    )
+  ) +
+    geom_point(
+      size = 6,
+      stroke = 0.8,
+      alpha = 0.9
+    ) +
+    geom_text(
+      aes(label = Group),
+      vjust = -1.4,
+      size = 3,
+      color = "black",
+      check_overlap = FALSE,
+      show.legend = FALSE
+    ) +
+    labs(
+      title = paste0(
+        "Supplemental Figure ",
+        figure_name,
+        ": K-means Clustering"
+      ),
+      subtitle = paste0(
+        n_pcs_80,
+        " PCs retained; gap k = ",
+        gap_k,
+        "; silhouette k = ",
+        silhouette_k
+      ),
+      x = x_label,
+      y = y_label,
+      color = "Cluster"
+    ) +
+  theme_classic() +
+    theme(
+      text = element_text(size = 15),
+    plot.margin = margin(
+      t = 20,
+      r = 20,
+      b = 10,
+      l = 10
+    ),
+
+    axis.title.y = element_text(
+      size = 15,
+      color = "black"
+    ),
+
+    axis.title.x = element_text(
+      size = 15,
+      color = "black"
+    ),
+
+    axis.ticks = element_line(
+      linewidth = 1.5,
+      color = "black"
+    ),
+
+    axis.ticks.length = unit(
+      0.4,
+      "cm"
+    ),
+
+    axis.line = element_line(
+      linewidth = 1.2,
+      color = "black"
+    )
+  )
+
+
+  ggsave(
+    filename = paste0(
+      figure_name,
+      "_clusters.pdf"
+    ),
+    plot = cluster_plot,
+    path = figure_save,
+    width = 9,
+    height = 7
+  )
+
+
+  # ----------------------------------------------------------
+  # t-SNE using the same retained PCA scores
+  # ----------------------------------------------------------
+
+  max_valid_perplexity <- floor(
+    (nrow(pca_results) - 2) / 3
+  )
+
+  perplexity_used <- min(
+    10,
+    max_valid_perplexity
+  )
+
+  if (perplexity_used >= 1) {
+
+    message(
+      figure_name,
+      ": using t-SNE perplexity = ",
+      perplexity_used
+    )
+
+    set.seed(42)
+
+    tsne_result <- Rtsne(
+      as.matrix(pca_results),
+      dims = 2,
+      perplexity = perplexity_used,
+      max_iter = 1000,
+      verbose = TRUE,
+      check_duplicates = FALSE,
+      pca = FALSE
+    )
+
+    tsne_coordinates <- as.data.frame(
+      tsne_result$Y
+    )
+
+    colnames(tsne_coordinates) <- c(
+      "tSNE1",
+      "tSNE2"
+    )
+
+    tsne_df <- bind_cols(
+      analysis_df %>%
+        select(
+          File,
+          Group
+        ),
+      tsne_coordinates
+    )
+
+    tsne_results[[figure_name]] <- tsne_df
+
+    write.csv(
+      tsne_df,
+      file.path(
+        figure_save,
+        paste0(
+          figure_name,
+          "_tSNE_coordinates.csv"
+        )
+      ),
+      row.names = FALSE
+    )
+
+    tsne_plot <- ggplot(
+      tsne_df,
+      aes(
+        x = tSNE1,
+        y = tSNE2,
+        fill = Group
+      )
+    ) +
+      geom_point(
+        size = 8,
+        shape = 21,
+        color = "black",
+        stroke = 1.2
+      ) +
+      scale_fill_manual(
+        values = group_colors,
+        drop = FALSE,
+        na.value = "gray70"
+      ) +
+      labs(
+        title = NULL,
+        x = NULL,
+        y = NULL
+      ) +
+      theme_classic() +
+      theme(
+        text = element_text(size = 30),
+        legend.position = "none",
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        plot.margin = margin(
+          t = 10,
+          r = 10,
+          b = 10,
+          l = 10
+        )
+      )
+
+    print(tsne_plot)
+
+    ggsave(
+      filename = paste0(
+        figure_name,
+        "_tSNE.pdf"
+      ),
+      plot = tsne_plot,
+      path = figure_save,
+      width = 8,
+      height = 6,
+      dpi = 300
+    )
+
+  } else {
+
+    warning(
+      figure_name,
+      ": too few observations for t-SNE."
+    )
+
+    perplexity_used <- NA_integer_
+  }
+
+
+  # ----------------------------------------------------------
+  # Add both methods to summary
+  # ----------------------------------------------------------
+
+  current_summary <- data.frame(
+    figure = figure_name,
+    n_cells = nrow(analysis_df),
+    n_variables = ncol(clust_data),
+
+    variables = paste(
+      variables,
+      collapse = "; "
+    ),
+
+    PCs_for_80_percent = n_pcs_80,
+
+    cumulative_variance = cumulative_variance[
+      n_pcs_80
+    ],
+
+    silhouette_clusters = silhouette_k,
+
+    optimal_silhouette_width = optimal_silhouette,
+
+    gap_clusters = gap_k,
+
+    selected_gap = selected_gap,
+
+    final_clusters_used = gap_k,
+
+    final_selection_method = "Gap statistic: firstSEmax",
+
+    tsne_perplexity = perplexity_used,
+
+    tsne_seed = 42,
+
+    tsne_iterations = 1000
+  )
+
+
+  clustering_summary <- bind_rows(
+    clustering_summary,
+    current_summary
+  )
+}
+
+
+# ============================================================
+# Save overall summary
+# ============================================================
+
+write.csv(
+  clustering_summary,
+  file.path(
+    save,
+    "Supplemental_Figure_7_analysis_summary.csv"
+  ),
+  row.names = FALSE
+)
+
+print(clustering_summary)
+```
+
+```{r}
+# ============================================================
+# File paths
+# ============================================================
+
+save <- here("Morphology", "Clustering", "7G_with_physiology")
+
+dir.create(
+  save,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# ============================================================
+# Excel file path
+# ============================================================
+
+excel_file <- here("data", "rawdata.xlsx")
+
+
+# ============================================================
+# Load reconstruction and physiology sheets
+# ============================================================
+
+reconstruction_data <- read_excel(
+  excel_file,
+  sheet = "Reconstructions"
+)
+
+physiology_data <- read_excel(
+  excel_file,
+  sheet = "physiology"
+)
+
+
+# ============================================================
+# Variables used for Supplemental Figure 7G
+# ============================================================
+
+variables_7G <-c(
+    "stratification",
+    "somadiameter",
+    "convexhull",
+    "monoorbi",
+    "asymmetry",
+    "equaldf",
+    "branchlengthsum",
+    "branchlengthn"
+  )
+
+
+# ============================================================
+# Prepare reconstruction cells
+# ============================================================
+
+reconstruction_df <- reconstruction_data %>%
+  transmute(
+    File = trimws(as.character(File)),
+    Group = as.character(Group),
+    Phys = NA_character_,
+    data_source = "Reconstruction",
+    across(
+      all_of(variables_7G),
+      as.numeric
+    )
+  )
+
+
+# ============================================================
+# Prepare physiology cells
+# ============================================================
+
+physiology_df <- physiology_data %>%
+  transmute(
+    File = trimws(as.character(File)),
+    Group = as.character(Group),
+    Phys = trimws(as.character(physiology)),
+    data_source = "Physiology",
+    across(
+      all_of(variables_7G),
+      as.numeric
+    )
+  )
+
+
+# ============================================================
+# Combine both datasets
+# ============================================================
+
+combined_df <- bind_rows(
+  reconstruction_df,
+  physiology_df
+) %>%
+  distinct(
+    File,
+    .keep_all = TRUE
+  ) %>%
+  filter(
+    complete.cases(
+      across(
+        all_of(variables_7G)
+      )
+    )
+  )
+
+
+message(
+  "Reconstruction cells included: ",
+  sum(combined_df$data_source == "Reconstruction")
+)
+
+message(
+  "Physiology cells included: ",
+  sum(combined_df$data_source == "Physiology")
+)
+
+
+# ============================================================
+# Check which physiology cells were excluded
+# ============================================================
+
+excluded_physiology <- physiology_df %>%
+  filter(
+    !complete.cases(
+      across(
+        all_of(variables_7G)
+      )
+    )
+  ) %>%
+  rowwise() %>%
+  mutate(
+    missing_variables = paste(
+      variables_7G[
+        is.na(
+          c_across(
+            all_of(variables_7G)
+          )
+        )
+      ],
+      collapse = ", "
+    )
+  ) %>%
+  ungroup()
+
+
+write.csv(
+  excluded_physiology,
+  file.path(
+    save,
+    "7G_excluded_physiology_cells.csv"
+  ),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# Create clustering matrix
+# ============================================================
+
+clust_data <- combined_df %>%
+  select(
+    all_of(variables_7G)
+  )
+
+
+# Remove zero-variance variables
+variable_sd <- sapply(
+  clust_data,
+  sd,
+  na.rm = TRUE
+)
+
+zero_variance_variables <- names(
+  variable_sd[
+    is.na(variable_sd) |
+      variable_sd == 0
+  ]
+)
+
+if (length(zero_variance_variables) > 0) {
+
+  warning(
+    "Removing zero-variance variables: ",
+    paste(
+      zero_variance_variables,
+      collapse = ", "
+    )
+  )
+
+  clust_data <- clust_data %>%
+    select(
+      -all_of(zero_variance_variables)
+    )
+}
+
+
+# ============================================================
+# PCA
+# ============================================================
+
+pca <- prcomp(
+  clust_data,
+  center = TRUE,
+  scale. = TRUE
+)
+
+variance_explained <- (
+  pca$sdev^2 /
+    sum(pca$sdev^2)
+) * 100
+
+cumulative_variance <- cumsum(
+  variance_explained
+)
+
+n_pcs_80 <- which(
+  cumulative_variance >= 80
+)[1]
+
+pca_results <- as.data.frame(
+  pca$x[
+    ,
+    seq_len(n_pcs_80),
+    drop = FALSE
+  ]
+)
+
+message(
+  "Using ",
+  n_pcs_80,
+  " PCs explaining ",
+  round(
+    cumulative_variance[n_pcs_80],
+    2
+  ),
+  "% of total variance."
+)
+
+ # ----------------------------------------------------------
+  # Define possible values of k
+  # ----------------------------------------------------------
+
+  max_k <- min(
+    10,
+    nrow(pca_results) - 1
+  )
+
+  k_values <- 2:max_k
+
+  # ----------------------------------------------------------
+  # Silhouette analysis
+  # ----------------------------------------------------------
+
+  distance_matrix <- dist(
+    pca_results,
+    method = "euclidean"
+  )
+
+
+  silhouette_results <- data.frame(
+    k = k_values,
+    average_silhouette_width = NA_real_
+  )
+
+
+  for (i in seq_along(k_values)) {
+
+    current_k <- k_values[i]
+
+    set.seed(123)
+
+    temporary_kmeans <- kmeans(
+      pca_results,
+      centers = current_k,
+      nstart = 50,
+      iter.max = 1000
+    )
+
+
+    silhouette_object <- silhouette(
+      temporary_kmeans$cluster,
+      distance_matrix
+    )
+
+
+    silhouette_results$average_silhouette_width[i] <-
+      mean(
+        silhouette_object[, "sil_width"]
+      )
+  }
+
+
+  silhouette_k <- silhouette_results$k[
+    which.max(
+      silhouette_results$average_silhouette_width
+    )
+  ]
+
+
+  optimal_silhouette <- max(
+    silhouette_results$average_silhouette_width
+  )
+
+
+  message(
+    figure_name,
+    ": silhouette selected k = ",
+    silhouette_k,
+    " (average width = ",
+    round(
+      optimal_silhouette,
+      3
+    ),
+    ")"
+  )
+
+
+  write.csv(
+    silhouette_results,
+    file.path(
+      figure_save,
+      paste0(
+        figure_name,
+        "_silhouette_results.csv"
+      )
+    ),
+    row.names = FALSE
+  )
+
+
+  # ----------------------------------------------------------
+  # Silhouette plot
+  # ----------------------------------------------------------
+
+  silhouette_plot <- ggplot(
+    silhouette_results,
+    aes(
+      x = k,
+      y = average_silhouette_width
+    )
+  ) +
+    geom_line(
+      linewidth = 1
+    ) +
+    geom_point(
+      size = 3
+    ) +
+    geom_vline(
+      xintercept = silhouette_k,
+      linetype = "dashed"
+    ) +
+    scale_x_continuous(
+      breaks = k_values
+    ) +
+    labs(
+      title = paste0(
+        "Supplemental Figure ",
+        figure_name,
+        ": Silhouette Method"
+      ),
+      subtitle = paste0(
+        "Selected k = ",
+        silhouette_k
+      ),
+      x = "Number of clusters",
+      y = "Average silhouette width"
+    ) +
+    theme_minimal()
+
+
+  ggsave(
+    filename = paste0(
+      figure_name,
+      "_silhouette.pdf"
+    ),
+    plot = silhouette_plot,
+    path = figure_save,
+    width = 8,
+    height = 6
+  )
+
+
+
+# ============================================================
+# Final k-means clustering
+# ============================================================
+
+set.seed(123)
+
+final_kmeans <- kmeans(
+  pca_results,
+  centers = gap_k,
+  nstart = 50,
+  iter.max = 1000
+)
+
+cluster_assignments <- bind_cols(
+  combined_df %>%
+    select(
+      File,
+      Group,
+      Phys,
+      data_source
+    ),
+  pca_results
+) %>%
+  mutate(
+    cluster = factor(
+      final_kmeans$cluster
+    )
+  )
+
+
+write.csv(
+  cluster_assignments,
+  file.path(
+    save,
+    "7G_cluster_assignments_with_physiology.csv"
+  ),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# Stacked bar graph: group composition within each cluster
+# ============================================================
+
+group_colors <- c(
+  "Alpha ON" = "#009967",
+  "Alpha OFF" = "#006b99",
+  "Asymmetric" = "#1b0099",
+  "Non-Alpha" = "#540099",
+  "Equal Bistratified" = "#950099",
+  "Unequal Bistratified" = "#990032"
+)
+
+cluster_composition <- cluster_assignments %>%
+  filter(
+    !is.na(Group)
+  ) %>%
+  count(
+    cluster,
+    Group,
+    name = "n_cells"
+  )
+
+composition_plot <- ggplot(
+  cluster_composition,
+  aes(
+    x = cluster,
+    y = n_cells,
+    fill = Group
+  )
+) +
+  geom_col(
+    color = "black",
+    linewidth = 0.5
+  ) +
+  scale_fill_manual(
+    values = group_colors,
+    drop = FALSE
+  ) +
+  labs(
+    title = NULL,
+    x = "Cluster assignment",
+    y = "Number of cells",
+    fill = "Group"
+  ) +
+  theme_classic() +
+  theme(
+    text = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16)
+  )
+
+ggsave(
+  filename = "7G_cluster_group_composition.pdf",
+  plot = composition_plot,
+  path = save,
+  width = 9,
+  height = 7
+)
+
+
+# ============================================================
+# Run t-SNE on the combined PCA results
+# ============================================================
+
+max_valid_perplexity <- floor(
+  (nrow(pca_results) - 2) / 3
+)
+
+perplexity_used <- min(
+  10,
+  max_valid_perplexity
+)
+
+if (perplexity_used < 1) {
+  stop("Not enough complete observations to run t-SNE.")
+}
+
+set.seed(42)
+
+tsne_result <- Rtsne(
+  as.matrix(pca_results),
+  dims = 2,
+  perplexity = perplexity_used,
+  max_iter = 1000,
+  verbose = TRUE,
+  check_duplicates = FALSE,
+  pca = FALSE
+)
+
+tsne_df <- bind_cols(
+  cluster_assignments,
+  data.frame(
+    tSNE1 = tsne_result$Y[, 1],
+    tSNE2 = tsne_result$Y[, 2]
+  )
+)
+
+
+write.csv(
+  tsne_df,
+  file.path(
+    save,
+    "7G_tSNE_coordinates_with_physiology.csv"
+  ),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# Physiology cells to highlight in each separate plot
+# ============================================================
+
+highlight_lists <- list(
+  "Alpha ON" = c(
+    "NL0176", "NL0118", "NL0161", "NL0175"
+  ),
+
+  "Alpha OFF" = c(
+    "NL0113", "NL0183"
+  ),
+
+  "Non-Alpha" = c(
+    "NL0170"
+  ),
+
+  "Equal Bistratified" = c(
+    "NL0109", "NL0159", "NL0163",
+    "NL0171", "NL0182", "NL0184"
+  ),
+
+  "Unequal Bistratified" = c(
+    "NL0110", "NL0157", "NL0162", "NL0164",
+    "NL0168", "NL0169", "NL0172", "NL0173",
+    "NL0160", "NL0114", "NL0181"
+  )
+)
+
+
+# ============================================================
+# Make one t-SNE plot per group
+# ============================================================
+
+for (grp in names(highlight_lists)) {
+
+  cells_to_highlight <- trimws(highlight_lists[[grp]])
+  highlight_color <- unname(group_colors[grp])
+
+  # Mark only the selected cells for this plot
+  plot_df <- tsne_df %>%
+    mutate(
+      File = trimws(as.character(File)),
+      Highlight = File %in% cells_to_highlight
+    )
+
+  highlighted_df <- plot_df %>%
+    filter(Highlight)
+
+  # Warn if any requested cells were excluded or not found
+  missing_cells <- setdiff(
+    cells_to_highlight,
+    plot_df$File
+  )
+
+  if (length(missing_cells) > 0) {
+    warning(
+      grp,
+      ": these cells were not included in the final 7G t-SNE: ",
+      paste(missing_cells, collapse = ", ")
+    )
+  }
+
+  # Stop this iteration if none of the requested cells are present
+  if (nrow(highlighted_df) == 0) {
+    warning(
+      grp,
+      ": no highlighted cells were available, so no plot was saved."
+    )
+    next
+  }
+
+  p <- ggplot(
+    plot_df,
+    aes(
+      x = tSNE1,
+      y = tSNE2
+    )
+  ) +
+
+    # All non-highlighted cells shown faintly by morphological group
+    geom_point(
+      data = plot_df %>%
+        filter(!Highlight),
+      aes(fill = Group),
+      shape = 21,
+      size = 8,
+      color = "black",
+      stroke = 1.2,
+      alpha = 0.15
+    ) +
+
+    # Selected physiology cells for this group
+    geom_point(
+      data = highlighted_df,
+      shape = 21,
+      size = 10,
+      fill = highlight_color,
+      color = "black",
+      stroke = 1.5,
+      alpha = 1
+    ) +
+
+    # Physiology labels for selected cells
+    geom_text_repel(
+      data = highlighted_df %>%
+        filter(
+          !is.na(Phys),
+          trimws(Phys) != ""
+        ),
+      aes(label = Phys),
+    size = 6,
+    color = "black",
+    box.padding = 0.5,
+    point.padding = 0.3,
+    show.legend = FALSE
+    ) +
+    scale_fill_manual(values = group_colors) +
+    theme_classic() +
+    labs(title = NULL, x = NULL, y = NULL) +
+    theme(
+      text = element_text(size = 30),
+      legend.position = "none",
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10),
+      axis.text.y = element_blank(),
+      axis.text.x = element_blank(),
+      axis.ticks = element_line(linewidth = 1.5),
+      axis.ticks.length = unit(0.4, "cm")
+    )
+
+  print(p)
+
+  safe_group_name <- gsub(
+    pattern = "[^A-Za-z0-9]+",
+    replacement = "_",
+    x = grp
+  )
+
+  ggsave(
+    filename = file.path(
+      save,
+      paste0(
+        "7G_tSNE_highlight_",
+        safe_group_name,
+        ".pdf"
+      )
+    ),
+    plot = p,
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+}
+```
+
+
+
+

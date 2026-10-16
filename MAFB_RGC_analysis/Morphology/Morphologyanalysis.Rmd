@@ -1,0 +1,1006 @@
+---
+title: "Morphology Analysis"
+author: "Nina"
+date: "2024-09-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+libraries
+```{r}
+library(ggplot2)
+library(readxl)
+library(openxlsx)
+library(dplyr)
+library(factoextra)
+library(cluster)
+library(rstatix)
+library(knitr)
+library(ggsignif)
+library(purrr)
+library(tidyr)
+library(RColorBrewer)
+library(scales)
+library(tibble)
+library(FSA)
+library(car)
+library(patchwork)
+library(cowplot)
+library(grid)
+```
+Loading data
+```{r}
+save <- here("Morphology", "Morphology Script", "graphs")
+
+# Excel file path
+excel_file <- here("data", "rawdata.xlsx")
+
+# Read reconstruction data
+data <- read_excel(
+  excel_file,
+  sheet = "Reconstructions"
+)
+```
+This is for cell counts and the splitting of the cells. 
+```{r}
+# Create initial data subset (if needed)
+data_subset <- data[, c("File","somaarea", "somadiameter","zdepth1", "zdepth2", "df", "2df", "dfdiameter", "2dfdiameter","equaldf", "combineddf", "function", "monoorbi", "asymmetry", "branchlengthsum", "branchlengthn", "convexhull", "depth", "tips", "zcoordinate", "density", "complexity")]
+
+# Default Group to Unclassified
+data$Group <- "Unclassified"
+
+# Keep only rows with all needed info
+classifiable <- data %>%
+  filter(!is.na(`dfdiameter`),
+    !is.na(`function`),
+    !is.na(`monoorbi`),
+    !is.na(`asymmetry`),
+    !is.na(`df`),
+    !is.na(`2df`))
+
+# Initialize Group column
+classifiable$Group <- NA
+
+# Split mono vs bi
+mono_rows <- classifiable$monoorbi == 1
+bi_rows <- !mono_rows
+
+# -------------------
+# MONOSTRATIFIED
+# -------------------
+# For monostratified, check dfdiameter
+mono_df_large <- mono_rows & classifiable$dfdiameter >= 225
+mono_df_small <- mono_rows & classifiable$dfdiameter < 225
+
+# For large dfdiameter: Alpha, split ON/OFF
+classifiable$Group[mono_df_large] <- ifelse(
+  classifiable$zdepth1[mono_df_large] <= 16,
+  "Alpha ON",
+  "Alpha OFF"
+)
+
+# For small dfdiameter: Non-Alpha, split Asymmetric/Non-Alpha
+classifiable$Group[mono_df_small] <- ifelse(
+  classifiable$asymmetry[mono_df_small] < 0.30,
+  "Asymmetric",
+  "Non-Alpha"
+)
+
+# -------------------
+# BISTRATIFIED
+# -------------------
+# For bistratified, compare df vs 2df
+bi_equal <- bi_rows & (abs(classifiable$df - classifiable$`2df`) / classifiable$df <= 0.20)
+bi_unequal <- bi_rows & !bi_equal
+
+classifiable$Group[bi_equal] <- "Equal Bistratified"
+classifiable$Group[bi_unequal] <- "Unequal Bistratified"
+
+# -------------------
+# Join back with original data
+# -------------------
+data_with_groups <- data %>%
+  select(-Group) %>%
+  left_join(
+    classifiable[, c("File", "Group")],
+    by = "File"
+  ) %>%
+  mutate(Group = ifelse(is.na(Group), "Unclassified", Group))
+
+
+wb <- openxlsx::loadWorkbook(excel_file)
+
+# Write updated data into Reconstructions sheet
+openxlsx::writeData(
+  wb,
+  sheet = "Reconstructions",
+  x = data_with_groups
+)
+
+# Save back to the same workbook
+openxlsx::saveWorkbook(
+  wb,
+  excel_file,
+  overwrite = TRUE
+)
+```
+```{r}
+category_counts <- table(data_with_groups$Group, useNA = "no")
+category_df <- as.data.frame(category_counts)
+colnames(category_df) <- c("Category", "Count")
+
+# Omit "Unclassified"
+category_df <- category_df[category_df$Category != "Unclassified", ]
+
+# Reorder factor levels
+category_df$Category <- factor(category_df$Category, 
+                               levels = c("Alpha ON", "Alpha OFF", "Asymmetric", 
+                                          "Equal Bistratified", "Non-Alpha", "Unequal Bistratified"))
+
+# Define custom colors
+custom_colors <- c(
+  "Alpha ON" = "#009967",       
+  "Alpha OFF" = "#006b99",      
+  "Asymmetric" = "#1b0099",     
+  "Non-Alpha" = "#540099",      
+  "Equal Bistratified" = "#950099",  
+  "Unequal Bistratified" = "#990032" 
+)
+
+# Plot
+counts <- ggplot(category_df, aes(x = Category, y = Count, color = Category)) + 
+  geom_bar(width = 0.8, fill = "white", stat = "identity", size = 1) +
+  scale_color_manual(values = custom_colors) + 
+  theme_classic() +
+  labs(title = NULL, x = NULL, y = "# of reconstructions") +  
+  theme(
+    legend.position = "none",
+    plot.margin = margin(t = 30, r = 10, b = 10, l = 10),
+    axis.text.y = element_text(size = 16, color = "black"),     
+    axis.title.y = element_text(size = 20),
+    #axis.text.x = element_blank(),
+    axis.ticks = element_line(size = 1.5),             # Tick thickness
+    axis.ticks.length = unit(0.4, "cm")
+  ) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 25)) 
+
+counts
+
+ggsave("reconstructioncount.pdf", plot = counts, path = save, width = 10, height = 6, dpi = 300)
+
+write.csv(
+  category_df,
+  file = "Morphology_Group_Counts.csv",
+  row.names = FALSE
+)
+```
+```{r}
+test_summary <- data.frame(
+  Parameter = character(),
+  Normal = logical(),
+  Bartlett_p = numeric(),
+  Recommended_Test = character(),
+  Recommended_Posthoc = character(),
+  stringsAsFactors = FALSE
+)
+
+parameters <- c(
+  "zdepth1", "zdepth2", "somadiameter", "dfdiameter", "2dfdiameter",
+  "combineddf", "equaldf", "asymmetry", "branchlengthsum",
+  "branchlengthn", "tips", "convexhull", "density",
+  "complexity", "zcoordinate"
+)
+
+for (param in parameters) {
+
+  cat("\nChecking:", param, "\n")
+
+  # Use only the two bistratified groups for variables
+  # that only apply to bistratified cells
+  if (param %in% c("zdepth2", "2dfdiameter", "equaldf")) {
+
+    filtered_data <- data_with_groups %>%
+      filter(
+        Group %in% c(
+          "Equal Bistratified",
+          "Unequal Bistratified"
+        ),
+        !is.na(.data[[param]])
+      )
+
+  } else {
+
+    filtered_data <- data_with_groups %>%
+      filter(
+        !is.na(.data[[param]]),
+        !is.na(Group),
+        Group != "Unclassified"
+      )
+  }
+
+  if (nrow(filtered_data) == 0) {
+    cat("No data to analyze for", param, "\n")
+    next
+  }
+
+  # Number of groups actually included
+  n_groups <- dplyr::n_distinct(filtered_data$Group)
+
+  # Shapiro-Wilk test within each group
+  normality_results <- filtered_data %>%
+    group_by(Group) %>%
+    group_modify(~ {
+
+      if (nrow(.x) >= 3) {
+
+        test_result <- tryCatch(
+          shapiro.test(.x[[param]])$p.value,
+          error = function(e) NA_real_
+        )
+
+        tibble(
+          shapiro_p_value = test_result
+        )
+
+      } else {
+
+        tibble(
+          shapiro_p_value = NA_real_
+        )
+      }
+    }) %>%
+    ungroup()
+
+  # All groups with valid Shapiro results must have p > 0.05
+  valid_shapiro <- normality_results$shapiro_p_value[
+    !is.na(normality_results$shapiro_p_value)
+  ]
+
+  is_normal <- length(valid_shapiro) > 0 &&
+    all(valid_shapiro > 0.05)
+
+  # Bartlett test only when normal
+  bartlett_test <- NULL
+
+  if (is_normal) {
+
+    bartlett_test <- tryCatch(
+      bartlett.test(
+        as.formula(paste0("`", param, "` ~ Group")),
+        data = filtered_data
+      ),
+      error = function(e) NULL
+    )
+
+    variance_p_value <- if (!is.null(bartlett_test)) {
+      bartlett_test$p.value
+    } else {
+      NA_real_
+    }
+
+  } else {
+
+    variance_p_value <- NA_real_
+  }
+
+  print(normality_results)
+
+  if (is_normal && !is.null(bartlett_test)) {
+    print(bartlett_test)
+  } else {
+    cat(
+      "Skipped Bartlett's test due to non-normality ",
+      "or insufficient data.\n",
+      sep = ""
+    )
+  }
+
+  # -------------------------------------------------------
+  # Select overall test and follow-up test
+  # -------------------------------------------------------
+
+  if (!is_normal) {
+
+    if (n_groups == 2) {
+      recommended_test <- "Wilcoxon rank-sum test"
+      recommended_posthoc <- "None: only two groups"
+    } else {
+      recommended_test <- "Kruskal-Wallis"
+      recommended_posthoc <- "Dunn's test with BH correction"
+    }
+
+  } else if (
+    !is.na(variance_p_value) &&
+    variance_p_value > 0.05
+  ) {
+
+    if (n_groups == 2) {
+      recommended_test <- "Student's two-sample t-test"
+      recommended_posthoc <- "None: only two groups"
+    } else {
+      recommended_test <- "One-way ANOVA"
+      recommended_posthoc <- "Tukey HSD"
+    }
+
+  } else {
+
+    if (n_groups == 2) {
+      recommended_test <- "Welch's two-sample t-test"
+      recommended_posthoc <- "None: only two groups"
+    } else {
+      recommended_test <- "Welch's ANOVA"
+      recommended_posthoc <- "Games-Howell"
+    }
+  }
+
+  cat(
+    "→ Use ", recommended_test,
+    " for ", param,
+    "\n→ Follow-up: ", recommended_posthoc,
+    "\n",
+    sep = ""
+  )
+
+  test_summary <- bind_rows(
+    test_summary,
+    data.frame(
+      Parameter = param,
+      Normal = is_normal,
+      Bartlett_p = variance_p_value,
+      Number_of_Groups = n_groups,
+      Recommended_Test = recommended_test,
+      Recommended_Posthoc = recommended_posthoc,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+write.csv(
+  test_summary,
+  file = file.path(
+    save,
+    "Statistical_Test_Recommendations.csv"
+  ),
+  row.names = FALSE
+)
+
+test_summary
+```
+Loop for kruskal wallis
+```{r}
+# List of variables to analyze
+variables <- c(
+  "zdepth1", "zdepth2", "somadiameter", "dfdiameter", "combineddf",
+  "asymmetry", "branchlengthsum", "branchlengthn", "tips",
+  "density", "complexity", "zcoordinate"
+)
+
+y_labels <- c(
+  "Z-depth 1",
+  "Z-depth 2",
+  "Soma diameter",
+  expression("Dendritic field diameter" ~ µm^2),
+  expression("Combined dendritic field" ~ µm^2),
+  "Asymmetric index",
+  "Branch length sum",
+  "Branch length n",
+  "Number of terminal tips",
+  "Arbor density",
+  "Arbor complexity",
+  "Furthest zcoordinate"
+)
+
+# Fixed group order
+desired_order <- c(
+  "Alpha ON", "Alpha OFF", "Asymmetric",
+  "Non-Alpha", "Equal Bistratified", "Unequal Bistratified"
+)
+
+# Heatmap order
+x_order <- c(
+  "Unequal Bistratified", "Equal Bistratified", "Non-Alpha",
+  "Asymmetric", "Alpha OFF", "Alpha ON"
+)
+y_order <- x_order
+
+# Fixed significance colors
+sig_colors <- c(
+  "****" = "#1A5A8B",
+  "***"  = "#386C9C",
+  "**"   = "#5C88B7",
+  "*"    = "#A4C8E1",
+  "ns"   = "#EEF3F7")
+
+# ---------------------------------
+# Save standalone significance legend ONCE
+# ---------------------------------
+legend_data <- data.frame(
+  x = 1:5,
+  y = 1,
+  sig_bin = factor(c("****", "***", "**", "*", "ns"),
+                   levels = c("****", "***", "**", "*", "ns"))
+)
+
+legend_plot <- ggplot(legend_data, aes(x = x, y = y, fill = sig_bin)) +
+  geom_tile() +
+  scale_fill_manual(
+    values = sig_colors,
+    drop = FALSE,
+    name = "Significance",
+    labels = c(
+      "****" = "p < 0.0001",
+      "***"  = "p < 0.001",
+      "**"   = "p < 0.01",
+      "*"    = "p < 0.05",
+      "ns"   = "ns"
+    )
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 18)
+  )
+
+legend_only <- cowplot::get_legend(legend_plot)
+
+ggsave(
+  filename = "significance_legend.pdf",
+  plot = legend_only,
+  path = save,
+  width = 3,
+  height = 4,
+  dpi = 300
+)
+
+# ---------------------------------
+# Main loop
+# ---------------------------------
+for (i in seq_along(variables)) {
+
+  var <- variables[i]
+  y_label <- y_labels[i]
+
+  # Filter data
+  filtered_data <- data_with_groups %>%
+    filter(!is.na(.data[[var]]), !is.na(Group), Group != "Unclassified") %>%
+    mutate(Group = factor(Group, levels = desired_order))
+
+  # Kruskal-Wallis test
+  kruskal_result <- kruskal.test(as.formula(paste(var, "~ Group")), data = filtered_data)
+  print(kruskal_result)
+
+  # Dunn's test
+  dunn_result <- dunnTest(as.formula(paste(var, "~ Group")), data = filtered_data, method = "bh")
+
+  # Save significant results
+  significant_results <- dunn_result$res %>%
+    filter(P.adj < 0.05) %>%
+    select(Comparison, Z, P.adj)
+
+   # Create pvalue folder if it doesn't exist
+  dir.create(file.path(save, "pvalue"),
+             recursive = TRUE,
+             showWarnings = FALSE)
+  
+  write.table(
+    significant_results,
+    file = file.path(save, "pvalue", paste0("significant_results_loop_", var, ".txt")),
+    sep = "\t",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  # Summary statistics
+  summary_data <- filtered_data %>%
+    group_by(Group) %>%
+    summarise(
+      mean_value = mean(.data[[var]], na.rm = TRUE),
+      se_value   = sd(.data[[var]], na.rm = TRUE) / sqrt(n()),
+      .groups = "drop"
+    ) %>%
+    mutate(Group = factor(Group, levels = desired_order))
+
+  # Y-axis scaling
+  max_value <- max(filtered_data[[var]], na.rm = TRUE)
+  y_max <- max_value * 1.2
+
+  # ---------------------------
+  # Boxplot
+  # ---------------------------
+  boxplot <- ggplot(filtered_data, aes(x = Group, y = .data[[var]], color = Group)) +
+    geom_boxplot(fill = "white", outlier.shape = NA, size = 1) +
+    geom_jitter(
+      aes(fill = Group),
+      color = "black",
+      shape = 21,
+      width = 0.15,
+      size = 2,
+      stroke = 0.8,
+      alpha = 1
+    ) +
+    scale_fill_manual(values = custom_colors) +
+    scale_color_manual(values = custom_colors) +
+    theme_classic() +
+    labs(title = NULL, x = NULL, y = y_label) +
+    theme(
+      text = element_text(size = 30),
+      legend.position = "none",
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10),
+      axis.text.y = element_text(size = 16, color = "black"),
+      axis.title.y = element_text(size = 16),
+      axis.text.x = element_text(size = 16, color = "black"),
+      axis.ticks = element_line(size = 1.5, color = "black"),
+      axis.ticks.length = unit(0.4, "cm")
+    ) +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, y_max + 0.1))
+
+  ggsave(
+    paste0(var, "_kruskal.pdf"),
+    plot = boxplot,
+    path = save,
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+
+  # ---------------------------
+  # Heatmap prep
+  # ---------------------------
+  heatmap_data <- dunn_result$res %>%
+    select(Comparison, P.adj) %>%
+    separate(Comparison, into = c("group1", "group2"), sep = " - ")
+
+  heatmap_data_sym <- heatmap_data %>%
+    bind_rows(heatmap_data %>% rename(group1 = group2, group2 = group1))
+
+  heatmap_data_wide <- heatmap_data_sym %>%
+    pivot_wider(names_from = group2, values_from = P.adj)
+
+  heatmap_data_wide[is.na(heatmap_data_wide)] <- 1
+
+  heatmap_long <- heatmap_data_wide %>%
+    pivot_longer(cols = -group1, names_to = "group2", values_to = "p_value") %>%
+    mutate(
+      significance = case_when(
+        p_value < 0.0001 ~ "****",
+        p_value < 0.001  ~ "***",
+        p_value < 0.01   ~ "**",
+        p_value < 0.05   ~ "*",
+        TRUE             ~ ""
+      ),
+      sig_bin = case_when(
+        p_value < 0.0001 ~ "****",
+        p_value < 0.001  ~ "***",
+        p_value < 0.01   ~ "**",
+        p_value < 0.05   ~ "*",
+        TRUE             ~ "ns"
+      ),
+      sig_bin = factor(sig_bin, levels = c("****", "***", "**", "*", "ns"))
+    ) %>%
+    mutate(
+      group1 = factor(group1, levels = x_order),
+      group2 = factor(group2, levels = y_order)
+    ) %>%
+    filter(as.numeric(group1) >= as.numeric(group2)) %>%
+    mutate(group1 = factor(group1, levels = rev(levels(group1))))
+
+  # ---------------------------
+  # Heatmap with discrete bins and NO legend
+  # ---------------------------
+  heatplot <- ggplot(heatmap_long, aes(x = group1, y = group2, fill = sig_bin)) +
+    geom_tile(color = "black") +
+    geom_text(
+      aes(label = significance),
+      color = "white",
+      size = 10,
+      hjust = 0.5,
+      vjust = 0.5
+    ) +
+    theme_void() +
+    coord_fixed(ratio = 1) +
+    scale_fill_manual(
+      values = sig_colors,
+      drop = FALSE
+    ) +
+    theme(
+      text = element_text(size = 30),
+      legend.position = "none",
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10),
+      axis.text.y = element_text(size = 16, color = "black"),
+      axis.title.y = element_text(size = 16),
+      axis.text.x = element_text(size = 16, color = "black"),
+      axis.ticks = element_line(color = "black"),
+      panel.border = element_blank()
+    ) +
+    labs(x = NULL, y = NULL, title = NULL) +
+    scale_y_discrete(position = "left")
+
+  ggsave(
+    paste0(var, "_heatmap.pdf"),
+    plot = heatplot,
+    path = save,
+    width = 6,
+    height = 6,
+    dpi = 300
+  )
+
+  print(boxplot)
+  print(heatplot)
+}
+```
+
+```{r}
+---------------------------
+# Variables to analyze
+# ---------------------------
+variables <- c("2dfdiameter", "equaldf", "convexhull")
+
+y_labels <- c(
+  "2df diameter",
+  "% difference between DF1 and DF2",
+  expression("Convex hull" ~ µm^3)
+)
+
+# ---------------------------
+# Group order
+# ---------------------------
+desired_order <- c(
+  "Alpha ON",
+  "Alpha OFF",
+  "Asymmetric",
+  "Non-Alpha",
+  "Equal Bistratified",
+  "Unequal Bistratified"
+)
+
+x_order <- c(
+  "Unequal Bistratified",
+  "Equal Bistratified",
+  "Non-Alpha",
+  "Asymmetric",
+  "Alpha OFF",
+  "Alpha ON"
+)
+
+y_order <- x_order
+
+# ---------------------------
+# Fixed significance colors
+# dark -> light
+# ---------------------------
+sig_colors <- c(
+  "****" = "#1A5A8B",
+  "***"  = "#386C9C",
+  "**"   = "#5C88B7",
+  "*"    = "#A4C8E1",
+  "ns"   = "#EEF3F7")
+
+
+# ---------------------------
+# Export legend ONCE
+# ---------------------------
+legend_data <- data.frame(
+  x = 1:5,
+  y = 1,
+  sig_bin = factor(
+    c("****", "***", "**", "*", "ns"),
+    levels = c("****", "***", "**", "*", "ns")
+  )
+)
+
+legend_plot <- ggplot(legend_data, aes(x = x, y = y, fill = sig_bin)) +
+  geom_tile() +
+  scale_fill_manual(
+    values = sig_colors,
+    drop = FALSE,
+    name = "Significance",
+    labels = c(
+      "****" = "p < 0.0001",
+      "***"  = "p < 0.001",
+      "**"   = "p < 0.01",
+      "*"    = "p < 0.05",
+      "ns"   = "ns"
+    )
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 18)
+  )
+
+legend_only <- cowplot::get_legend(legend_plot)
+
+ggsave(
+  filename = "significance_legend.pdf",
+  plot = legend_only,
+  path = save,
+  width = 3,
+  height = 4,
+  dpi = 300
+)
+
+# ---------------------------
+# Main loop
+# ---------------------------
+for (i in seq_along(variables)) {
+  
+  var <- variables[i]
+  y_label <- y_labels[i]
+  
+  # Start from original data each loop so modifications do not carry over
+  plot_data <- data_with_groups
+  
+  # Special handling for equaldf
+  if (var == "equaldf") {
+    plot_data <- plot_data %>%
+      mutate(equaldf = ifelse(equaldf == 100, NA, equaldf))
+  }
+  
+  # Filter data
+  filtered_data <- plot_data %>%
+    filter(!is.na(.data[[var]]), !is.na(Group), Group != "Unclassified") %>%
+    mutate(Group = factor(Group, levels = desired_order))
+  
+  # Keep only groups with at least 2 observations
+  group_counts <- filtered_data %>%
+    group_by(Group) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    filter(n >= 2)
+  
+  if (nrow(group_counts) < 2) {
+    message("Skipping ", var, ": not enough valid groups with n >= 2")
+    next
+  }
+  
+  filtered_data <- filtered_data %>%
+    filter(Group %in% group_counts$Group) %>%
+    droplevels()
+  
+  # Welch's ANOVA
+  oneway_test_result <- tryCatch({
+    oneway.test(
+      as.formula(paste0("`", var, "` ~ Group")),
+      data = filtered_data,
+      var.equal = FALSE
+    )
+  }, error = function(e) {
+    message("Welch's ANOVA failed for ", var, ": ", e$message)
+    NULL
+  })
+  
+  if (!is.null(oneway_test_result)) {
+    print(oneway_test_result)
+  }
+  
+  # Games-Howell post-hoc test
+  games_howell_result <- tryCatch({
+    games_howell_test(
+      filtered_data,
+      formula = as.formula(paste0("`", var, "` ~ Group")),
+      conf.level = 0.95,
+      detailed = TRUE
+    )
+  }, error = function(e) {
+    message("Games-Howell failed for ", var, ": ", e$message)
+    NULL
+  })
+  
+  if (is.null(games_howell_result)) next
+  
+  # Save significant pairwise comparisons
+  significant_results <- games_howell_result %>%
+    filter(p.adj.signif != "ns")
+  
+  # Create pvalue folder if it doesn't exist
+  dir.create(file.path(save, "pvalue"),
+             recursive = TRUE,
+             showWarnings = FALSE)
+  
+  write.table(
+    significant_results,
+    file = file.path(save, "pvalue", paste0("significant_results_loop_", var, ".txt")),
+    sep = "\t",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  # Summary stats
+  summary_data <- filtered_data %>%
+    group_by(Group) %>%
+    summarise(
+      mean_value = mean(.data[[var]], na.rm = TRUE),
+      se_value   = sd(.data[[var]], na.rm = TRUE) / sqrt(n()),
+      .groups = "drop"
+    ) %>%
+    mutate(Group = factor(Group, levels = desired_order))
+  
+  # Y-axis scaling
+  max_value <- max(filtered_data[[var]], na.rm = TRUE)
+  y_max <- max_value * 1.2
+  
+  # ---------------------------
+  # Boxplot
+  # ---------------------------
+  boxplot <- ggplot(filtered_data, aes(x = Group, y = .data[[var]], color = Group)) +
+    geom_boxplot(fill = "white", outlier.shape = NA, size = 1) +
+    geom_jitter(
+      aes(fill = Group),
+      color = "black",
+      shape = 21,
+      width = 0.15,
+      size = 2,
+      stroke = 0.8,
+      alpha = 1
+    ) +
+    scale_fill_manual(values = custom_colors) +
+    scale_color_manual(values = custom_colors) +
+    theme_classic() +
+    labs(title = NULL, x = NULL, y = y_label) +
+    theme(
+      text = element_text(size = 30),
+      legend.position = "none",
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10),
+      axis.text.y = element_text(size = 16, color = "black"),
+      axis.title.y = element_text(size = 16),
+      axis.text.x = element_text(size = 16, color = "black"),
+      axis.ticks = element_line(size = 1.5, color = "black"),
+      axis.ticks.length = unit(0.4, "cm")
+    ) +
+    scale_y_continuous(
+      expand = c(0, 0),
+      limits = c(0, y_max + 0.1)
+    )
+  
+  ggsave(
+    paste0(var, "_welch.pdf"),
+    plot = boxplot,
+    path = save,
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+  
+  # ---------------------------
+  # Heatmap prep
+  # ---------------------------
+  heatmap_data <- games_howell_result %>%
+    select(group1, group2, p.adj)
+  
+  heatmap_data_sym <- bind_rows(
+    heatmap_data,
+    heatmap_data %>% rename(group1 = group2, group2 = group1)
+  )
+  
+  heatmap_data_wide <- heatmap_data_sym %>%
+    pivot_wider(names_from = group2, values_from = p.adj)
+  
+  heatmap_data_wide[is.na(heatmap_data_wide)] <- 1
+  
+  heatmap_long <- heatmap_data_wide %>%
+    pivot_longer(cols = -group1, names_to = "group2", values_to = "p_value") %>%
+    mutate(
+      significance = case_when(
+        p_value < 0.0001 ~ "****",
+        p_value < 0.001  ~ "***",
+        p_value < 0.01   ~ "**",
+        p_value < 0.05   ~ "*",
+        TRUE             ~ ""
+      ),
+      sig_bin = case_when(
+        p_value < 0.0001 ~ "****",
+        p_value < 0.001  ~ "***",
+        p_value < 0.01   ~ "**",
+        p_value < 0.05   ~ "*",
+        TRUE             ~ "ns"
+      ),
+      sig_bin = factor(sig_bin, levels = c("****", "***", "**", "*", "ns")),
+      group1 = factor(group1, levels = x_order),
+      group2 = factor(group2, levels = y_order)
+    ) %>%
+    filter(as.numeric(group1) >= as.numeric(group2)) %>%
+    mutate(group1 = factor(group1, levels = rev(levels(group1))))
+  
+  # ---------------------------
+  # Heatmap
+  # ---------------------------
+  heatplot <- ggplot(heatmap_long, aes(x = group1, y = group2, fill = sig_bin)) +
+    geom_tile(color = "black") +
+    geom_text(aes(label = significance), color = "white", size = 5) +
+    theme_void() +
+    coord_fixed(ratio = 1) +
+    scale_fill_manual(
+      values = sig_colors,
+      drop = FALSE
+    ) +
+    theme(
+      text = element_text(size = 30),
+      legend.position = "none",
+      plot.margin = margin(t = 10, r = 10, b = 10, l = 10),
+      axis.text.y = element_text(size = 16, color = "black"),
+      axis.title.y = element_text(size = 16),
+      axis.text.x = element_text(size = 16, color = "black"),
+      axis.ticks = element_line(color = "black"),
+      panel.border = element_blank()
+    ) +
+    labs(x = NULL, y = NULL, title = NULL) +
+    scale_y_discrete(position = "left")
+  
+  ggsave(
+    paste0(var, "_heatmap.pdf"),
+    plot = heatplot,
+    path = save,
+    width = 6,
+    height = 6,
+    dpi = 300
+  )
+  
+  print(boxplot)
+  print(heatplot)
+}
+```
+Summary table
+```{r}
+
+summary_table <- data_with_groups %>%
+  filter(!is.na(Group), Group != "Unclassified") %>%  
+  group_by(Group) %>%
+  summarise(
+    N = n(),
+    mean_zdepth1 = mean(`zdepth1`, na.rm = TRUE),
+    sd_zdepth1 = sd(`zdepth1`, na.rm = TRUE),
+    
+    mean_zdepth2 = mean(`zdepth2`, na.rm = TRUE),
+    sd_zdepth2 = sd(`zdepth2`, na.rm = TRUE),
+    
+    mean_soma_diameter = mean(`somadiameter`, na.rm = TRUE),
+    sd_soma_diameter = sd(`somadiameter`, na.rm = TRUE),
+    
+    mean_dfdiameter = mean(dfdiameter, na.rm = TRUE),
+    sd_dfdiameter = sd(dfdiameter, na.rm = TRUE),
+    
+    mean_2dfdiameter = mean(`2dfdiameter`, na.rm = TRUE),
+    sd_2dfdiameter = sd(`2dfdiameter`, na.rm = TRUE),
+    
+    mean_equaldf = mean(equaldf, na.rm = TRUE),
+    sd_equaldf = sd(equaldf, na.rm = TRUE),
+    
+    mean_asymmetry = mean(asymmetry, na.rm = TRUE),
+    sd_asymmetry = sd(asymmetry, na.rm = TRUE),
+    
+    mean_density = mean(density, na.rm = TRUE),
+    sd_density = sd(density, na.rm = TRUE),
+    
+    mean_complexity = mean(complexity, na.rm = TRUE),
+    sd_complexity = sd(complexity, na.rm = TRUE),
+    
+  )
+
+# Format table to display mean (SD), and replace "0 (0)" with "-" for `2df`
+formatted_table <- summary_table %>%
+  mutate(
+    `Average z-depth1` = paste0(round(mean_zdepth1, 1), " (", round(sd_zdepth1, 1), ")"),
+    `Average z-depth2` = paste0(round(mean_zdepth2, 1), " (", round(sd_zdepth2, 1), ")"),
+    `Soma Diameter` = paste0(round(mean_soma_diameter, 1), " (", round(sd_soma_diameter, 1), ")"),
+    `DF1 Diameter` = paste0(round(mean_dfdiameter, 1), " (", round(sd_dfdiameter, 1), ")"),
+    `DF2 Diameter` = paste0(round(mean_2dfdiameter, 1), " (", round(sd_2dfdiameter, 1), ")"),
+    `% difference between DF1 and DF2` = paste0(round(mean_equaldf, 1), " (", round(sd_equaldf, 1), ")"),
+    `Asymmetry` = paste0(round(mean_asymmetry, 1), " (", round(sd_asymmetry, 1), ")"),
+    `Density` = paste0(round(mean_density, 1), " (", round(sd_density, 1), ")"),
+    `Complexity` = paste0(round(mean_complexity, 1), " (", round(sd_complexity, 1), ")"),
+    `N` = N
+  ) %>%
+  select(Group, N, `Average z-depth1`, `Average z-depth2`, `Soma Diameter`, `DF1 Diameter`,  `DF2 Diameter`, `% difference between DF1 and DF2`, `Asymmetry`, `Density`, `Complexity`)
+
+# Print the formatted table using kable
+kable(formatted_table, col.names = c("Group", "N", "Average z-depth 1", "Average z-depth 2", "Soma Diameter", "DF1 Diameter", "DF2 Diameter", "% difference between DF1 and DF2", "Asymmetry", "Density", "Complexity"), 
+      caption = "Summary of mean values for morphological characteristics by RGC type.")
+
+# Export as CSV
+write.csv(formatted_table, "summarytable.csv", row.names = FALSE)
+
+
+```

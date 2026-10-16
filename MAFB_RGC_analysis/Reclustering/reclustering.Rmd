@@ -1,0 +1,614 @@
+---
+title: "reclustering"
+author: "Nina"
+date: "2026-05-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Seurat)
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(future)
+library(patchwork)
+library(ggplot2)
+```
+
+Download GSE133382_AtlasRGCs_CountMatrix.csv and RGC_Atlas_coordinates.txt from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE133382 and place into data folder.
+
+```{r}
+save <- here("Reclustering")
+dir.create(save, recursive = TRUE, showWarnings = FALSE)
+
+data_dir <- here("data")
+```
+
+```{r}
+counts <- read_csv(
+  file.path(data_dir, "GSE133382_AtlasRGCs_CountMatrix.csv"),
+  show_col_types = FALSE
+)
+
+# first column = gene names
+gene_names <- counts[[1]]
+
+# remove gene column
+counts <- counts[, -1]
+
+# convert to dataframe and set rownames
+counts <- as.data.frame(counts)
+rownames(counts) <- gene_names
+
+# make Seurat object
+rgc <- CreateSeuratObject(
+  counts = counts,
+  min.cells = 3,
+  min.features = 200
+)
+
+rgc$sample_id <- sub("_.*", "", colnames(rgc))
+
+table(rgc$sample_id)
+
+metadata <- read.delim(
+  file.path(data_dir,"RGC_Atlas_coordinates.txt"),
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+head(metadata)
+colnames(metadata)
+dim(metadata)
+
+# make rownames = cell names
+rownames(metadata) <- metadata$NAME
+
+# add metadata to Seurat object
+rgc <- AddMetaData(
+  rgc,
+  metadata = metadata[colnames(rgc), ]
+)
+```
+
+```{r}
+#helps to make the code not as memory heavy
+plan(sequential)
+options(future.globals.maxSize = 10 * 1024^3)
+
+# 1. Add mito percent
+rgc[["percent.mt"]] <- PercentageFeatureSet(
+  rgc,
+  pattern = "^mt-"
+)
+
+# 1b. Add ribosomal percent
+rgc[["percent.ribo"]] <- PercentageFeatureSet(
+  rgc,
+  pattern = "^Rp[sl]"
+)
+
+# optional sanity check
+VlnPlot(
+  rgc,
+  features = c("percent.mt", "percent.ribo"),
+  pt.size = 0
+)
+
+# 2. Make sample + batch grouping
+rgc$sample_batch <- paste(
+  rgc$SampleID,
+  rgc$BatchID,
+  sep = "_"
+)
+
+# 3. Split by sample ID + batch
+rgc_list <- SplitObject(
+  rgc,
+  split.by = "sample_batch"
+)
+
+# 4. SCTransform each split object
+rgc_list <- lapply(rgc_list, function(x) {
+  SCTransform(
+    x,
+    vars.to.regress = c(
+      "percent.mt",
+      "percent.ribo"
+    ),
+    verbose = FALSE
+  )
+})
+
+# 5. Select 3000 anchor features
+features <- SelectIntegrationFeatures(
+  object.list = rgc_list,
+  nfeatures = 3000
+)
+
+# 6. Prep SCT integration
+rgc_list <- PrepSCTIntegration(
+  object.list = rgc_list,
+  anchor.features = features
+)
+
+# 7. Find anchors
+anchors <- FindIntegrationAnchors(
+  object.list = rgc_list,
+  normalization.method = "SCT",
+  anchor.features = features
+)
+
+# 8. Integrate data
+rgc_integrated <- IntegrateData(
+  anchorset = anchors,
+  normalization.method = "SCT"
+)
+
+# 9. Standard Seurat workflow
+DefaultAssay(rgc_integrated) <- "integrated"
+
+rgc_integrated <- RunPCA(rgc_integrated, verbose = FALSE)
+
+atlas_scree <- ElbowPlot(
+  rgc_integrated,
+  ndims = 20
+)
+
+atlas_scree
+
+rgc_integrated <- RunUMAP(
+  rgc_integrated,
+  dims = 1:15
+)
+
+rgc_integrated <- FindNeighbors(
+  rgc_integrated,
+  dims = 1:15
+)
+
+rgc_integrated <- FindClusters(
+  rgc_integrated,
+  resolution = 0.5
+)
+
+
+ggsave(
+  "RGC_integrated_scree_plot.pdf",
+  plot = atlas_scree,
+  width = 7,
+  height = 5
+)
+
+# 10. Subset Mafb-associated Tran clusters
+mafb_clusters <- c(
+  "23_W3D2",
+  "30_Novel",
+  "34_Novel",
+  "39_Novel",
+  "43_AlphaONS",
+  "45_AlphaOFFT"
+)
+
+mafb <- subset(
+  rgc_integrated,
+  subset = Cluster %in% mafb_clusters
+)
+
+# 11. Re-run dimensionality reduction on Mafb subset
+DefaultAssay(mafb) <- "integrated"
+
+mafb <- RunPCA(mafb, verbose = FALSE)
+
+mafb_scree <- ElbowPlot(
+  mafb,
+  ndims = 20
+)
+
+mafb_scree
+
+ggsave(
+  "MAFB_subset_scree_plot.pdf",
+  plot = mafb_scree,
+  width = 7,
+  height = 5
+)
+
+
+# -----------------------------
+# Test different PC numbers
+# -----------------------------
+
+pc_values <- 5:15
+
+pc_results <- list()
+
+for (pc in pc_values) {
+  
+  message("Running PCs 1:", pc)
+  
+  mafb_pc <- mafb
+  
+  mafb_pc <- RunUMAP(
+    mafb_pc,
+    dims = 1:pc,
+    reduction.name = paste0("umap_pc", pc),
+    reduction.key = paste0("UMAPPC", pc, "_")
+  )
+  
+  mafb_pc <- FindNeighbors(
+    mafb_pc,
+    dims = 1:pc,
+    graph.name = paste0("SCT_snn_pc", pc)
+  )
+  
+  mafb_pc <- FindClusters(
+    mafb_pc,
+    graph.name = paste0("SCT_snn_pc", pc),
+    resolution = 0.3,
+    cluster.name = paste0("seurat_clusters_pc", pc)
+  )
+  
+  p1 <- DimPlot(
+    mafb_pc,
+    reduction = paste0("umap_pc", pc),
+    group.by = "Cluster",
+    label = TRUE
+  ) +
+    ggtitle(paste0("Tran clusters, PCs 1:", pc))
+  
+  p2 <- DimPlot(
+    mafb_pc,
+    reduction = paste0("umap_pc", pc),
+    group.by = paste0("seurat_clusters_pc", pc),
+    label = TRUE
+  ) +
+    ggtitle(paste0("Seurat clusters, PCs 1:", pc))
+  
+  ggsave(
+    filename = paste0("MAFB_umap_TranClusters_PC", pc, ".pdf"),
+    plot = p1,
+    width = 10,
+    height = 8
+  )
+  
+  ggsave(
+    filename = paste0("MAFB_umap_SeuratClusters_PC", pc, ".pdf"),
+    plot = p2,
+    width = 10,
+    height = 8
+  )
+  
+  cluster_table <- table(
+    mafb_pc$Cluster,
+    mafb_pc[[paste0("seurat_clusters_pc", pc)]][, 1]
+  )
+  
+  write.csv(
+    as.data.frame.matrix(cluster_table),
+    paste0("MAFB_cluster_table_PC", pc, ".csv")
+  )
+  
+  pc_results[[paste0("PC", pc)]] <- list(
+    object = mafb_pc,
+    tran_plot = p1,
+    seurat_plot = p2,
+    cluster_table = cluster_table
+  )
+  
+  rm(mafb_pc)
+  gc()
+}
+
+print(mafb[["pca"]], dims = 1:15, nfeatures = 10)
+
+pca_loadings <- Loadings(mafb[["pca"]])
+
+write.csv(
+  pca_loadings,
+  "MAFB_PCA_gene_loadings.csv"
+)
+
+sink("MAFB_PCA_loadings_PC1_100.txt")
+
+print(
+  mafb[["pca"]],
+  dims = 1:9,
+  nfeatures = 100
+)
+
+sink()
+
+```
+
+```{r}
+# -----------------------------
+# Re-run MAFB subset using first 9 PCs
+# -----------------------------
+DefaultAssay(mafb) <- "integrated"
+
+mafb <- RunPCA(mafb, verbose = FALSE)
+
+mafb <- RunUMAP(
+  mafb,
+  dims = 1:9
+)
+
+mafb <- FindNeighbors(
+  mafb,
+  dims = 1:9
+)
+
+mafb <- FindClusters(
+  mafb,
+  resolution = 0.3
+)
+
+# plots
+mafbplot <- DimPlot(
+  mafb,
+  reduction = "umap",
+  group.by = "Cluster",
+  label = TRUE
+)
+
+mafbplot
+
+ggsave(
+  "mafb_umap_clusters_PC9.pdf",
+  plot = mafbplot,
+  width = 10,
+  height = 8
+)
+
+seuratplot <- DimPlot(
+  mafb,
+  reduction = "umap",
+  group.by = "seurat_clusters",
+  label = TRUE
+)
+
+seuratplot
+
+ggsave(
+  "mafb_umap_seurat_clusters_PC9.pdf",
+  plot = seuratplot,
+  width = 10,
+  height = 8
+)
+
+table(mafb$Cluster, mafb$seurat_clusters)
+```
+
+```{r}
+# -----------------------------
+# DEGs for original Tran clusters
+# -----------------------------
+DefaultAssay(mafb) <- "SCT"
+
+mafb_markers <- FindAllMarkers(
+  mafb,
+  group.by = "Cluster",
+  assay = "SCT",
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+write.csv(
+  mafb_markers,
+  "MAFB_Tran_clusters_markers_SCT_PC9.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+# set desired Tran cluster order
+mafb$Cluster <- factor(
+  mafb$Cluster,
+  levels = c(
+    "23_W3D2",
+    "30_Novel",
+    "43_AlphaONS",
+    "34_Novel",
+    "39_Novel",
+    "45_AlphaOFFT"
+  )
+)
+
+# top 10 markers per Tran cluster
+top_markers <- mafb_markers %>%
+  filter(
+    !grepl("^mt-", gene, ignore.case = TRUE),
+    !grepl("^Rp[sl]", gene)
+  ) %>%
+  group_by(cluster) %>%
+  slice_max(avg_log2FC, n = 10) %>%
+  ungroup()
+
+top_genes <- unique(top_markers$gene)
+
+DefaultAssay(mafb) <- "SCT"
+
+heatmap_plot <- DoHeatmap(
+  mafb,
+  features = top_genes,
+  group.by = "Cluster",
+  size = 3
+) +
+  NoLegend()
+
+heatmap_plot
+
+ggsave(
+  "MAFB_cluster_DEG_heatmap_PC9.pdf",
+  plot = heatmap_plot,
+  width = 14,
+  height = 10
+)
+```
+
+```{r}
+DefaultAssay(mafb) <- "RNA"
+
+mafb <- NormalizeData(mafb)
+
+# normalized expression matrix
+expr <- GetAssayData(
+  mafb,
+  assay = "RNA",
+  layer = "data"   # <- changed from slot
+)
+
+clusters <- sort(unique(mafb$seurat_clusters))
+
+shared_summary <- lapply(clusters, function(clust) {
+
+  cells <- colnames(mafb)[
+    mafb$seurat_clusters == clust
+  ]
+
+  mat <- expr[, cells]
+
+  data.frame(
+    gene = rownames(mat),
+    cluster = clust,
+    pct_expressing = rowMeans(mat > 0) * 100,
+    avg_expression = rowMeans(mat)
+  )
+
+}) %>%
+  bind_rows()
+
+# define shared genes
+shared_genes <- shared_summary %>%
+  filter(
+    !grepl("^mt-", gene, ignore.case = TRUE),
+    !grepl("^Rp[sl]", gene)
+  ) %>%
+  group_by(gene) %>%
+  summarise(
+    min_pct = min(pct_expressing),
+    mean_pct = mean(pct_expressing),
+    mean_expression = mean(avg_expression),
+    .groups = "drop"
+  ) %>%
+  filter(min_pct >= 25) %>%     # shared in every cluster
+  arrange(desc(mean_expression))
+
+# top 10
+top10_shared <- head(shared_genes, 10)
+
+top10_shared
+
+shared_dotplot <- DotPlot(
+  mafb,
+  features = top10_shared$gene,
+  group.by = "seurat_clusters",
+  assay = "RNA"
+) +
+  RotatedAxis() +
+  theme_classic()
+
+shared_dotplot
+
+ggsave(
+  "MAFB_top10_shared_genes.pdf",
+  plot = shared_dotplot,
+  width = 8,
+  height = 5
+)
+
+shared_summary %>%
+  filter(gene == "Mafb")
+```
+
+
+```{r}
+# -----------------------------
+# Get top 10 genes for PC1 and PC2
+# -----------------------------
+pca_loadings <- Loadings(mafb[["pca"]])
+
+pc1_pos <- names(sort(pca_loadings[, "PC_1"], decreasing = TRUE))[1:10]
+pc1_neg <- names(sort(pca_loadings[, "PC_1"], decreasing = FALSE))[1:10]
+
+pc2_pos <- names(sort(pca_loadings[, "PC_2"], decreasing = TRUE))[1:10]
+pc2_neg <- names(sort(pca_loadings[, "PC_2"], decreasing = FALSE))[1:10]
+
+pc_genes <- unique(c(pc1_pos, pc1_neg, pc2_pos, pc2_neg))
+
+pc_gene_table <- data.frame(
+  PC = c(
+    rep("PC1_positive", 10),
+    rep("PC1_negative", 10),
+    rep("PC2_positive", 10),
+    rep("PC2_negative", 10)
+  ),
+  gene = c(pc1_pos, pc1_neg, pc2_pos, pc2_neg)
+)
+
+pc_gene_table
+
+write.csv(
+  pc_gene_table,
+  "PC1_PC2_top10_genes.csv",
+  row.names = FALSE
+)
+mafb$Cluster <- factor(
+  mafb$Cluster,
+  levels = c(
+    "23_W3D2",
+    "30_Novel",
+    "43_AlphaONS",
+    "34_Novel",
+    "39_Novel",
+    "45_AlphaOFFT"
+  )
+)
+
+DefaultAssay(mafb) <- "RNA"
+mafb <- NormalizeData(mafb)
+
+pc12_dotplot <- DotPlot(
+  mafb,
+  features = pc_genes,
+  group.by = "Cluster",
+  assay = "RNA"
+) +
+  RotatedAxis() +
+  theme_classic()
+
+pc12_dotplot
+
+ggsave(
+  "PC1_PC2_top10_genes_by_TranCluster_dotplot.pdf",
+  plot = pc12_dotplot,
+  width = 14,
+  height = 5
+)
+DefaultAssay(mafb) <- "RNA"
+
+pc12_featureplot <- FeaturePlot(
+  mafb,
+  features = pc_genes,
+  reduction = "umap",
+  ncol = 5,
+  order = TRUE
+)
+
+pc12_featureplot
+
+ggsave(
+  "PC1_PC2_top10_genes_featureplots.pdf",
+  plot = pc12_featureplot,
+  width = 18,
+  height = 14
+)
+```
+
+
